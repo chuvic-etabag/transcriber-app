@@ -261,6 +261,40 @@ async function checkResume(file) {
     assert.ok(chunks[chunks.length - 1].end > SECONDS - 3, 'reads to the end: ' + chunks[chunks.length - 1].end);
   });
 
+  await test('FLAC with a long silent stretch: sections stay short (no memory blow-up)', async () => {
+    const file = path.join(media.DIR, 'silence-flac.flac');
+    if (!fs.existsSync(file)) {
+      media.ff(['-i', media.source(20), '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo:d=600', '-i', media.source(20),
+        '-filter_complex', '[0:a][1:a][2:a]concat=n=3:v=0:a=1', '-c:a', 'flac', file]);
+    }
+    const reader = await AudioReader.open(await blobFor(file), { decode: ffDecode });
+    let cursor = reader.firstCursor, longest = 0, end = 0;
+    while (cursor) {
+      const section = await reader.read(cursor);
+      if (!section) break;
+      longest = Math.max(longest, section.samples.length / RATE);
+      end = section.start + section.samples.length / RATE;
+      cursor = section.next;
+    }
+    assert.ok(longest <= 25 * 1.6, 'longest section ' + longest + ' s');
+    assert.ok(Math.abs(end - 640) < 1, 'reaches the end: ' + end);
+  });
+  await test('file stops being readable mid-way: an error, not "done"', async () => {
+    const blob = await fs.openAsBlob(f['mp3-cbr']);
+    let reads = 0;
+    const flaky = {
+      name: 'moving.mp3', type: 'audio/mpeg', size: blob.size, lastModified: 0,
+      slice: (a, b) => {
+        const part = blob.slice(a, b);
+        return { arrayBuffer: () => (++reads > 6 ? Promise.reject(new Error('NotReadableError')) : part.arrayBuffer()) };
+      }
+    };
+    const reader = await AudioReader.open(flaky, { decode: ffDecode });
+    let code = null;
+    try { await readAll(reader); } catch (e) { code = e.code; }
+    assert.strictEqual(code, 'fileRead');
+  });
+
   console.log('Silence');
   await test('silent chunks are detected, quiet speech is not', async () => {
     const silent = new Float32Array(RATE * 5);

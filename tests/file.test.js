@@ -495,6 +495,33 @@ const lower = (s) => s.toLowerCase().replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+
       assert.strictEqual(out.split('ask not what').length - 1, 1, 'transcribed once, not twice: ' + out);
     });
 
+    await test('Start Over tapped twice: transcribed once, not wiped later', async (page) => {
+      await openFileTab(page);
+      await chooseFile(page, files.ted);
+      await waitStatus(page, /Ready/);
+      await page.click('#file-start');
+      await page.waitForFunction(() => document.getElementById('file-transcript').value.length > 0, null, { timeout: 60000 });
+      await page.evaluate(() => { const f = window.transcriberApp.file; f.startOver(); f.startOver(); });
+      await waitStatus(page, /^Done/);
+      const done = await fileText(page);
+      await page.waitForTimeout(1500);
+      assert.strictEqual(await fileText(page), done, 'not cleared again afterwards');
+      assert.match(await text(page, '#file-status'), /^Done/);
+      const firstLine = done.split('\n')[0];
+      assert.strictEqual(done.split(firstLine).length - 1, 1, 'first section appears once');
+    });
+
+    await test('Start is blocked while a new file is still opening', async (page) => {
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /Ready/);
+      await page.setInputFiles('#file-input', files.long40);
+      const started = await page.evaluate(() => { window.transcriberApp.file.start(); return window.transcriberApp.file.running; });
+      assert.strictEqual(started, false);
+      await waitStatus(page, /long/);
+      assert.strictEqual(await text(page, '#file-name'), 'speech-40min.mp3');
+    });
+
     console.log('Problems, in plain words');
 
     await test('a text file: "not supported"', async (page) => {

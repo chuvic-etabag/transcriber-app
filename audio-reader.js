@@ -39,7 +39,7 @@
 
   function ReaderError(code, detail) {
     var e = new Error(detail || code);
-    e.code = code;   // 'unsupported' | 'unreadable' | 'noAudio' | 'tooLarge' | 'memory'
+    e.code = code;   // 'unsupported' | 'unreadable' | 'noAudio' | 'tooLarge' | 'memory' | 'fileRead'
     return e;
   }
 
@@ -59,7 +59,8 @@
       return new Uint8Array(buf);
     }, function (err) {
       if (isMemoryError(err)) throw ReaderError('memory', String(err));
-      throw ReaderError('unreadable', 'Could not read the file: ' + err);
+      // The file moved, changed or is still downloading: not something to skip past.
+      throw ReaderError('fileRead', 'Could not read the file: ' + err);
     });
   }
 
@@ -595,7 +596,7 @@
         var size = box.size === 0 ? self.file.size - offset : box.size;
         if (size < 8) return;
         if (moov) afterMoov++;
-        if (box.type === 'moov') moov = { offset: offset, size: size };
+        if (box.type === 'moov') moov = { offset: offset, size: size, header: box.header };
         if (box.type === 'moof') fragmented = true;
         offset += size;
         // One box after moov is enough to tell whether the file is fragmented.
@@ -608,7 +609,7 @@
       if (moov.size > 200 * 1024 * 1024) throw ReaderError('tooLarge', 'moov too large');
       return readBytes(self.file, moov.offset, moov.offset + moov.size);
     }).then(function (b) {
-      var root = { start: 8, end: b.length };
+      var root = { start: moov.header, end: b.length };
       var traks = children(b, root.start, root.end).filter(function (x) { return x.type === 'trak'; });
       var sawVideo = false;
       var chosen = null;
@@ -724,11 +725,13 @@
     // Group neighbouring samples into runs so we read the file in few pieces
     // (in a video file the sound is mixed in between pictures).
     var runs = [];
+    var runOf = [];       // which run each sample is in (offsets are not always in order)
     for (var i = from; i < last; i++) {
       var o = this.offsets[i], end = o + this.sizes[i];
       var run = runs[runs.length - 1];
       if (run && o >= run.end && o - run.end < 4096) run.end = end;
       else runs.push({ start: o, end: end });
+      runOf.push(runs.length - 1);
     }
     var parts = [];
     return runs.reduce(function (p, run) {
@@ -736,9 +739,8 @@
         return readBytes(self.file, run.start, run.end).then(function (bytes) { run.bytes = bytes; });
       });
     }, Promise.resolve()).then(function () {
-      var r = 0;
       for (var j = from; j < last; j++) {
-        while (self.offsets[j] >= runs[r].end) r++;
+        var r = runOf[j - from];
         var rel = self.offsets[j] - runs[r].start;
         var data = runs[r].bytes.subarray(rel, rel + self.sizes[j]);
         if (self.codec === 'aac') parts.push(adtsHeader(self.adts, data.length));
@@ -894,20 +896,22 @@
         var el = readElement(b, o);
         if (!el || el.size < 0) break;
         if (el.id === EBML.TrackEntry) {
-          var type = 0, number = 0, p = el.start;
+          var type = 0, number = 0, codecId = '', codecDelay = 0, p = el.start;
           while (p < el.start + el.size) {
             var c = readElement(b, p);
             if (!c || c.size < 0) break;
             if (c.id === EBML.TrackType) type = readUint(b, c.start, c.size);
             if (c.id === EBML.TrackNumber) number = readUint(b, c.start, c.size);
-            if (c.id === EBML.CodecID) self.codecId = ascii(b, c.start, c.size);
-            if (c.id === EBML.CodecDelay) self.codecDelay = readUint(b, c.start, c.size) / 1e9;
+            if (c.id === EBML.CodecID) codecId = ascii(b, c.start, c.size);
+            if (c.id === EBML.CodecDelay) codecDelay = readUint(b, c.start, c.size) / 1e9;
             p = c.start + c.size;
           }
           if (type === 1) sawVideo = true;
           if (type === 2 && !self.trackEntry) {
             self.trackEntry = b.slice(o, el.start + el.size);
             self.trackNumber = number;
+            self.codecId = codecId;
+            self.codecDelay = codecDelay;
           }
         }
         o = el.start + el.size;
@@ -1307,11 +1311,28 @@
   FlacReader.prototype.read = function (cursor) {
     var self = this;
     var first;
+    var want = SECTION_SECONDS * self.rate;
+    // Find the section end. Silence packs very small in FLAC, so a byte guess
+    // can cover far more time than planned: check the frame's sample number
+    // and move closer until the section is no longer than 1.5 times the plan.
+    function findEnd(distance, tries) {
+      var target = first.offset + Math.max(512, Math.round(distance));
+      if (target >= self.file.size) return Promise.resolve(null);
+      return self._findFrame(target).then(function (end) {
+        if (!end) return null;
+        var span = end.sample - first.sample;
+        if (span <= 0) {
+          // Not a believable frame (a false match): look a little further on.
+          return tries > 0 ? findEnd(distance + 4096, tries - 1) : end;
+        }
+        if (span > want * 1.5 && tries > 0 && distance > 1024) return findEnd(distance / 2, tries - 1);
+        return end;
+      });
+    }
     return this._findFrame(cursor.offset).then(function (f) {
       if (!f) return null;
       first = f;
-      var target = f.offset + Math.round(SECTION_SECONDS * self.bytesPerSecond);
-      return target >= self.file.size ? null : self._findFrame(target);
+      return findEnd(SECTION_SECONDS * self.bytesPerSecond, 20);
     }).then(function (end) {
       if (!first) return null;
       var stop = end ? end.offset : self.file.size;
@@ -1479,6 +1500,7 @@
   Chunker.prototype._fill = function () {
     var self = this;
     var need = (CHUNK_SECONDS + 1) * RATE;
+    if (this.stopped) return Promise.resolve();
     if (this.done || this.buf.length >= need) return Promise.resolve();
     var cursor = this.cursor;
     return this.reader.read(cursor).then(function (section) {
@@ -1500,16 +1522,19 @@
   /** Move past a section that could not be decoded. */
   Chunker.prototype._skipBadSection = function (cursor) {
     var self = this;
-    var saved = this.reader.decode;
-    this.reader.decode = function () { return Promise.resolve(new Float32Array(0)); };
-    return this.reader.read(cursor).then(function (section) {
-      self.reader.decode = saved;
+    var skipper = Object.create(this.reader);
+    skipper.decode = function () { return Promise.resolve(new Float32Array(0)); };
+    return skipper.read(cursor).then(function (section) {
       if (!section || !section.next) { self.done = true; return; }
       self.cursor = section.next;
-    }, function () {
-      self.reader.decode = saved;
-      self.done = true;
+    }, function (err) {
+      throw err;
     });
+  };
+
+  /** Stop reading ahead (after Cancel), so an old run doesn't keep decoding. */
+  Chunker.prototype.stop = function () {
+    this.stopped = true;
   };
 
   /** Where to cut: the quietest moment between 20 and 30 seconds. */
@@ -1528,7 +1553,7 @@
   Chunker.prototype.next = function () {
     var self = this;
     return this._fill().then(function () {
-      if (!self.buf.length) return null;
+      if (self.stopped || !self.buf.length) return null;
       var cut;
       if (self.buf.length <= CHUNK_SECONDS * RATE) {
         if (!self.done) return self.next();

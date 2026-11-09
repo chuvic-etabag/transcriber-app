@@ -33,6 +33,9 @@
     unreadable:
       'This file could not be read. It may be damaged or only partly downloaded. Try opening it in another app to check it plays, or choose a different file.',
     noAudio: 'This file has no sound to transcribe.',
+    fileRead:
+      'The file could not be read any more. It may have been moved, renamed or still be downloading. ' +
+      'Choose it again to carry on from where it stopped.',
     tooLarge:
       'This file is too large to read in this format. Save or convert it as MP3 or M4A and try again.',
     memory:
@@ -284,7 +287,7 @@
 
   FileTab.prototype._updateStartButton = function () {
     var els = this.els;
-    var canStart = Boolean(this.reader) && !this.running && !(this.job && this.job.done);
+    var canStart = Boolean(this.reader) && !this.running && !this._choosing && !(this.job && this.job.done);
     els.start.disabled = !canStart;
     els.startLabel.textContent = this.job && this.job.nextTime > 0 && !this.job.done
       ? 'Continue Transcribing' : 'Start Transcribing';
@@ -363,6 +366,15 @@
     this.message(MESSAGES.reading);
     this._progress(null);
     this.els.choose.disabled = true;
+    this._choosing = true;            // Start and Start Over wait until the new file is open
+    this.els.startOver.disabled = true;
+    this._updateStartButton();
+    function finished() {
+      self._choosing = false;
+      self.els.choose.disabled = self.running;
+      self.els.startOver.disabled = false;
+      self._updateStartButton();
+    }
     var reader, key, asked = false;
     return global.AudioReader.open(file).then(function (r) {
       reader = r;
@@ -385,8 +397,8 @@
       }
       return global.JobStore.getJob(key).catch(function () { return null; });
     }).then(function (job) {
-      self.els.choose.disabled = false;
-      if (asked) return;
+      finished();
+      if (asked || self.running) return;
       self.file = file;
       self.reader = reader;
       var sameAsBox = self.key === key;
@@ -402,7 +414,7 @@
       self._updateStartButton();
       self._longFileWarning();
     }).catch(function (err) {
-      self.els.choose.disabled = false;
+      finished();
       self._fail(err && err.code ? err.code : 'unreadable', err);
     });
   };
@@ -431,10 +443,12 @@
     var self = this;
     return global.JobStore.getPieces(job.key).then(function (pieces) {
       var saved = pieces.map(function (p) { return { start: p.start, end: p.end, text: p.text }; });
-      if (sameAsBox && self.edited && self.pieces.length <= saved.length) {
+      if (sameAsBox && self.edited) {
         // Keep the person's edits; add anything saved after the box was last stored.
-        saved.slice(self.pieces.length).forEach(function (p) { self._append(p); });
-        self.pieces = saved;
+        if (self.pieces.length < saved.length) {
+          saved.slice(self.pieces.length).forEach(function (p) { self._append(p); });
+          self.pieces = saved;
+        }
         self._saveState();
       } else {
         self.pieces = saved;
@@ -534,7 +548,7 @@
 
   FileTab.prototype.start = function () {
     var self = this;
-    if (this.running || !this.reader) return Promise.resolve();
+    if (this.running || this._choosing || !this.reader) return Promise.resolve();
     var model = this.model();
     var language = this.els.language.value;
     var reader = this.reader;
@@ -546,8 +560,9 @@
     var audioDone = 0;           // seconds of audio transcribed this run (for the time estimate)
     var job;
 
-    return isCached(model).then(function (cached) {
+    var run = isCached(model).then(function (cached) {
       self._download = cached;
+      if (self.cancelled) return;
       if (!cached.ready && global.navigator.onLine === false) {
         var e = new Error('offline'); e.code = 'offline'; throw e;
       }
@@ -568,6 +583,7 @@
       if (self.cancelled || !job) return null;
       startedAt = Date.now();
       var chunker = new global.AudioReader.Chunker(reader, { startTime: job.nextTime, startCursor: job.cursor });
+      self._chunker = chunker;
       self._showProgress(job.nextTime, reader.duration, withHours, null);
       var next = chunker.next();
       var id = 0;
@@ -602,6 +618,7 @@
       }
       return loop().then(function () { return chunker; });
     }).then(function (chunker) {
+      self._chunker = null;
       self._setRunning(false);
       if (self.cancelled || !job) {
         self._stoppedMessage();
@@ -622,10 +639,14 @@
       self._updateStartButton();
       global.JobStore.prune().catch(function () {});
     }).catch(function (err) {
+      if (self._chunker) self._chunker.stop();
+      self._chunker = null;
       self._setRunning(false);
       if (self.cancelled) { self._stoppedMessage(); return; }
       self._fail(err && err.code, err);
     });
+    this._run = run;
+    return run;
   };
 
   FileTab.prototype._showProgress = function (at, total, withHours, perSecond) {
@@ -658,6 +679,7 @@
     this.cancelled = true;
     this.els.cancel.disabled = true;
     this.message('Stopping…');
+    if (this._chunker) this._chunker.stop();   // no more reading ahead
     if (this.pending && this.pending.type === 'load') {
       // Can't pause a download: stop the worker; nothing half-downloaded is kept.
       this._workerFailed('cancelled');
@@ -668,14 +690,14 @@
 
   FileTab.prototype.startOver = function () {
     var self = this;
+    if (this._startingOver || this._choosing) return this._startingOver || Promise.resolve();
+    this.els.startOver.disabled = true;
     var wait = Promise.resolve();
     if (this.running) {
       this.cancel();
-      wait = new Promise(function (resolve) {
-        (function check() { if (!self.running) resolve(); else setTimeout(check, 50); })();
-      });
+      wait = this._run || Promise.resolve();
     }
-    return wait.then(function () {
+    this._startingOver = wait.then(function () {
       return self.key ? global.JobStore.deleteJob(self.key).catch(function () {}) : null;
     }).then(function () {
       self.job = null;
@@ -686,9 +708,15 @@
       self.onText();
       self._showResume('');
       self._progress(null);
+      self._startingOver = null;
+      self.els.startOver.disabled = false;
       if (self.reader) return self.start();
       self.message(MESSAGES.start);
+    }, function () {
+      self._startingOver = null;
+      self.els.startOver.disabled = false;
     });
+    return this._startingOver;
   };
 
   FileTab.prototype._fail = function (code, err) {
@@ -698,11 +726,12 @@
     if (code === 'offline' || (code === 'download' && global.navigator.onLine === false)) text = MESSAGES.offline(model, size);
     else if (code === 'download') text = MESSAGES.downloadFailed(model, size);
     else if (code === 'memory') text = MESSAGES.memory;
-    else if (code === 'worker') text = MESSAGES.workerFailed;
+    else if (code === 'worker' || code === 'other') text = MESSAGES.workerFailed;
     else if (code === 'cancelled') { this._stoppedMessage(); return; }
     else if (MESSAGES[code] && typeof MESSAGES[code] === 'string') text = MESSAGES[code];
     else text = MESSAGES.unreadable;
-    if (code === 'download' || code === 'offline' || code === 'worker') this._workerFailed('reset');
+    // Start fresh next time: a worker that failed (or ran out of memory) keeps its bloated memory.
+    if (['download', 'offline', 'worker', 'other', 'memory'].indexOf(code) !== -1) this._workerFailed('reset');
     this.message(text, 'error');
     this._progress(null);
     this._updateStartButton();
