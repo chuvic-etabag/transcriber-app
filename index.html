@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1f5fbf">
+  <meta name="description" content="Turn speech into text in Chrome on Android.">
+  <title>Transcriber</title>
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+  <!-- Phase 5 will link manifest.json and register service-worker.js here. -->
+</head>
+<body>
+  <header class="app-header">
+    <h1 class="app-title">Transcriber</h1>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Transcription Mode">
+    <button class="tab" role="tab" id="tab-live" aria-controls="panel-live" aria-selected="true">Live</button>
+    <button class="tab" role="tab" id="tab-file" aria-controls="panel-file" aria-selected="false" tabindex="-1">File</button>
+  </nav>
+
+  <main>
+    <!-- Live tab -->
+    <section class="panel" id="panel-live" role="tabpanel" aria-labelledby="tab-live">
+      <h2 class="visually-hidden">Live Microphone</h2>
+
+      <div class="field">
+        <label for="live-language">Language</label>
+        <select id="live-language">
+          <option value="en-US">English (US)</option>
+          <option value="en-PH">English (Philippines)</option>
+          <option value="fil-PH">Filipino</option>
+        </select>
+      </div>
+
+      <button id="live-toggle" class="big-button" type="button" aria-pressed="false">
+        <span class="mic-dot" aria-hidden="true"></span>
+        <span id="live-toggle-label">Start Listening</span>
+      </button>
+
+      <p id="live-status" class="status" role="status" aria-live="polite">
+        Tap Start Listening. Chrome will ask to use your microphone the first time. Tap Allow.
+      </p>
+    </section>
+
+    <!-- File tab (Phase 3) -->
+    <section class="panel" id="panel-file" role="tabpanel" aria-labelledby="tab-file" hidden>
+      <h2>Coming Soon</h2>
+      <p class="muted">Transcribing audio files (MP3, M4A, WAV, OGG, WEBM) will be added in a later version.</p>
+    </section>
+
+    <!-- Shared output area -->
+    <section class="output" aria-labelledby="output-heading">
+      <h2 id="output-heading">Transcript</h2>
+      <textarea id="transcript" class="transcript" rows="10"
+        placeholder="Your words will appear here." spellcheck="true"
+        aria-describedby="interim-label"></textarea>
+      <div class="interim-box">
+        <span id="interim-label" class="interim-label">Still Hearing</span>
+        <p id="interim" class="interim" aria-live="off"></p>
+      </div>
+    </section>
+  </main>
+
+  <script src="live.js"></script>
+  <script src="file.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
