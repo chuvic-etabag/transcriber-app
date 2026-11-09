@@ -94,7 +94,8 @@
     this._restartTimes = [];
     this._networkRetries = 0;
     this._fatal = false;
-    this._wakeLock = null;
+    // Keeps the screen on while listening (keep-awake.js); asks again if Android lets go.
+    this._awake = global.KeepAwake ? new global.KeepAwake() : null;
 
     var self = this;
     this._onVisibility = function () { self._handleVisibility(); };
@@ -406,24 +407,11 @@
 
   // Keep the screen on while listening; a sleeping screen stops the mic.
   LiveTranscriber.prototype._holdWakeLock = function () {
-    var self = this;
-    var nav = global.navigator;
-    if (this._wakeLock || !nav || !nav.wakeLock || !nav.wakeLock.request) return;
-    nav.wakeLock.request('screen').then(function (lock) {
-      if (self.state === 'idle') { lock.release(); return; }
-      self._wakeLock = lock;
-      lock.addEventListener('release', function () {
-        if (self._wakeLock === lock) self._wakeLock = null;
-      });
-    }).catch(function () { /* not allowed right now; that's fine */ });
+    if (this._awake) this._awake.start();
   };
 
   LiveTranscriber.prototype._releaseWakeLock = function () {
-    if (this._wakeLock) {
-      var lock = this._wakeLock;
-      this._wakeLock = null;
-      lock.release().catch(function () {});
-    }
+    if (this._awake) this._awake.stop();
   };
 
   global.LiveTranscriber = LiveTranscriber;
