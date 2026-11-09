@@ -103,14 +103,18 @@ async function startListening(page) {
       assert.strictEqual(await text(page, '#live-toggle-label'), 'Start Listening');
     });
 
-    await test('File tab shows Coming Soon', browser, async (page) => {
+    await test('File tab shows the file controls and its own transcript', browser, async (page) => {
       await page.click('#tab-file');
       assert.ok(await page.isVisible('#panel-file'));
       assert.ok(!(await page.isVisible('#panel-live')));
-      assert.strictEqual(await text(page, '#panel-file h2'), 'Coming Soon');
-      assert.ok(await page.isVisible('#transcript'));
+      assert.strictEqual(await text(page, '#file-choose'), 'Choose Audio or Video File');
+      assert.ok(await page.isVisible('#file-transcript'));
+      assert.ok(!(await page.isVisible('#transcript')));
+      assert.strictEqual(await text(page, '#output-heading'), 'File Transcript');
       await page.click('#tab-live');
       assert.ok(await page.isVisible('#panel-live'));
+      assert.ok(await page.isVisible('#transcript'));
+      assert.strictEqual(await text(page, '#output-heading'), 'Live Transcript');
     });
 
     await test('headings and buttons are in title case', browser, async (page) => {

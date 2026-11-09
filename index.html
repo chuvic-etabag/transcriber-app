@@ -44,25 +44,108 @@
       </p>
     </section>
 
-    <!-- File tab (Phase 3) -->
+    <!-- File tab -->
     <section class="panel" id="panel-file" role="tabpanel" aria-labelledby="tab-file" hidden>
-      <h2>Coming Soon</h2>
-      <p class="muted">Transcribing audio files (MP3, M4A, WAV, OGG, WEBM) will be added in a later version.</p>
+      <h2 class="visually-hidden">Audio or Video File</h2>
+
+      <input type="file" id="file-input" class="visually-hidden" tabindex="-1" aria-hidden="true"
+        accept="audio/*,video/*,.mp3,.m4a,.m4b,.aac,.wav,.ogg,.oga,.opus,.webm,.weba,.flac,.mp4,.m4v,.mov,.mkv,.3gp,.3g2">
+      <button id="file-choose" class="big-button" type="button">Choose Audio or Video File</button>
+
+      <div id="file-info" class="file-info" hidden>
+        <p id="file-name" class="file-name"></p>
+        <p id="file-details" class="muted"></p>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="file-language">Language</label>
+          <select id="file-language">
+            <option value="auto">Auto-Detect</option>
+            <option value="english">English</option>
+            <option value="tagalog">Filipino</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="file-speed">Speed</label>
+          <select id="file-speed" aria-describedby="speed-hint">
+            <option value="fast">Fast</option>
+            <option value="accurate">Accurate</option>
+          </select>
+        </div>
+      </div>
+      <p id="speed-hint" class="hint"></p>
+
+      <label class="check">
+        <input type="checkbox" id="file-timestamps">
+        <span>Show Timestamps</span>
+      </label>
+
+      <p id="model-note" class="note"></p>
+
+      <div id="file-replace" class="confirm" hidden>
+        <p id="file-replace-text"></p>
+        <div class="confirm-buttons">
+          <button id="file-replace-yes" class="small-button danger" type="button">Replace It</button>
+          <button id="file-replace-no" class="small-button" type="button">Keep It</button>
+        </div>
+      </div>
+
+      <button id="file-start" class="big-button" type="button" disabled>
+        <span id="file-start-label">Start Transcribing</span>
+      </button>
+      <button id="file-cancel" class="big-button stop" type="button" hidden>Cancel</button>
+
+      <div id="file-progress-box" class="progress-box" hidden>
+        <progress id="file-progress" max="100" value="0" aria-label="Progress"></progress>
+        <span id="file-percent" class="percent">0%</span>
+      </div>
+
+      <p id="file-status" class="status" role="status" aria-live="polite"></p>
+
+      <div id="file-resume" class="notice" hidden>
+        <p id="file-resume-text"></p>
+        <button id="file-start-over" class="small-button" type="button">Start Over</button>
+      </div>
     </section>
 
-    <!-- Shared output area -->
+    <!-- Shared output area: shows the transcript of the tab you are on -->
     <section class="output" aria-labelledby="output-heading">
-      <h2 id="output-heading">Transcript</h2>
+      <div class="output-head">
+        <h2 id="output-heading">Live Transcript</h2>
+        <span id="word-count" class="word-count" aria-live="polite">0 Words</span>
+      </div>
       <textarea id="transcript" class="transcript" rows="10"
         placeholder="Your words will appear here." spellcheck="true"
-        aria-describedby="interim-label"></textarea>
+        aria-labelledby="output-heading" aria-describedby="interim-label"></textarea>
+      <textarea id="file-transcript" class="transcript" rows="10" hidden
+        placeholder="The transcript of your file will appear here." spellcheck="true"
+        aria-labelledby="output-heading"></textarea>
       <div class="interim-box">
         <span id="interim-label" class="interim-label">Still Hearing</span>
         <p id="interim" class="interim" aria-live="off"></p>
       </div>
+
+      <div class="tools">
+        <button id="copy-button" class="tool-button" type="button">Copy</button>
+        <button id="download-button" class="tool-button" type="button">Download Text File</button>
+        <button id="clear-button" class="tool-button" type="button">Clear</button>
+      </div>
+      <div id="clear-confirm" class="confirm" hidden>
+        <p id="clear-confirm-text">Clear the whole transcript? This cannot be undone.</p>
+        <div class="confirm-buttons">
+          <button id="clear-yes" class="small-button danger" type="button">Yes, Clear It</button>
+          <button id="clear-no" class="small-button" type="button">Keep It</button>
+        </div>
+      </div>
+      <p id="output-status" class="status" role="status" aria-live="polite"></p>
+      <p class="muted saved-note">Transcripts are saved on this device, so a refresh will not lose them.</p>
     </section>
   </main>
 
+  <script src="keep-awake.js"></script>
+  <script src="audio-reader.js"></script>
+  <script src="job-store.js"></script>
   <script src="live.js"></script>
   <script src="file.js"></script>
   <script src="app.js"></script>

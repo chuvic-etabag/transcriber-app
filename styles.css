@@ -12,11 +12,18 @@
   --interim: #7a8394;
   --warn: #8a5a00;
   --error: #b3261e;
+  --ok: #1b6e3a;
+  --notice-bg: #eaf2ff;
+  --notice-border: #9ab8e8;
+  --confirm-bg: #fff4e5;
+  --confirm-border: #e0b36a;
   --radius: 14px;
   --tap: 48px;
 }
 
 * { box-sizing: border-box; }
+
+[hidden] { display: none !important; }
 
 html { -webkit-text-size-adjust: 100%; }
 
@@ -171,3 +178,88 @@ body[data-live-state="paused"] .mic-dot { opacity: 0.45; }
   color: var(--interim);
 }
 .interim { margin: 2px 0 0; color: var(--interim); font-style: italic; }
+
+/* ---------- File tab ---------- */
+
+.field-row { display: flex; gap: 12px; margin-top: 16px; }
+.field-row .field { flex: 1; min-width: 0; margin-bottom: 0; }
+.field-row select { width: 100%; }
+
+.hint, .note { margin: 8px 0 0; color: var(--muted); font-size: 0.95rem; }
+.note[data-kind="download"] { color: var(--warn); }
+.note[data-kind="ready"] { color: var(--ok); }
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--tap);
+  margin-top: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.check input { width: 24px; height: 24px; margin: 0; accent-color: var(--accent); }
+
+.file-info {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border-radius: 10px;
+  overflow-wrap: anywhere;
+}
+.file-name { margin: 0; font-weight: 700; }
+
+#file-start, #file-cancel { margin-top: 16px; }
+.big-button.stop { background: var(--stop); }
+
+.progress-box { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.progress-box progress { flex: 1; height: 14px; accent-color: var(--accent); }
+.percent { min-width: 3.5em; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.status[data-kind="done"] { color: var(--ok); font-weight: 600; }
+
+.notice, .confirm {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+.notice { background: var(--notice-bg); border-color: var(--notice-border); }
+.notice p, .confirm p { margin: 0 0 10px; }
+.confirm { background: var(--confirm-bg); border-color: var(--confirm-border); }
+.confirm-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ---------- Output tools (both tabs) ---------- */
+
+.output-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.word-count { color: var(--muted); font-size: 0.95rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.tools { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.tool-button, .small-button {
+  min-height: var(--tap);
+  padding: 0 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.tool-button { flex: 1 1 auto; padding: 0 12px; }
+#output-status { min-height: 0; }
+.tool-button:disabled, .small-button:disabled { opacity: 0.45; cursor: not-allowed; }
+.small-button.danger, .tool-button.danger { background: var(--stop); border-color: var(--stop); color: #fff; }
+.tool-button:focus-visible, .small-button:focus-visible, .check input:focus-visible {
+  outline: 3px solid #ffb300;
+  outline-offset: 2px;
+}
+.saved-note { margin-top: 8px; font-size: 0.85rem; }
+
+/* The Live-only "Still Hearing" line is hidden on the File tab. */
+body[data-tab="file"] .interim-box { display: none; }
+
+@media (max-width: 360px) {
+  .field-row { flex-direction: column; }
+}
