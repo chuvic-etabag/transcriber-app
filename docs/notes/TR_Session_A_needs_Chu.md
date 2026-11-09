@@ -2,14 +2,13 @@
 
 Phase 1 and Phase 2 are built and pushed to `main`. These items need you.
 
-## 1. Check That GitHub Pages Is On
+## 1. Open the Live Link
 
-I could not open github.io from the build machine, so I could not confirm the live link loads.
+GitHub Pages is already on and started publishing this version from `main` right after the push.
+I could not open github.io from the build machine, so please confirm the page loads:
+https://chuvic-etabag.github.io/transcriber-app/
 
-- Open https://chuvic-etabag.github.io/transcriber-app/ on your phone.
-- If it shows a 404, go to the repository on GitHub: **Settings → Pages → Build and deployment**,
-  choose **Deploy from a branch**, branch **main**, folder **/ (root)**, then **Save**.
-  The link usually works within 1 to 2 minutes.
+If you still see the old page, wait 1 to 2 minutes and reload.
 
 ## 2. Test Live Transcription on Your Android Phone
 
