@@ -109,7 +109,8 @@ begin
     if v_row.speechmatics_id is not null then
       -- Already sent to Speechmatics: hand back the same job instead of paying again.
       return jsonb_build_object('status', 'existing', 'id', v_row.id, 'speechmatics_id', v_row.speechmatics_id);
-    elsif v_row.created_at > now() - interval '2 minutes' then
+    elsif v_row.created_at > now() - interval '10 minutes' then
+      -- Still being sent (or it is unclear whether Speechmatics got it): don't risk a second job.
       return jsonb_build_object('status', 'busy', 'id', v_row.id);
     else
       update public.transcription_jobs
@@ -153,6 +154,38 @@ as $$
     where id = p_id;
 $$;
 
+-- The live job (not failed or rejected) for an uploaded file, if there is one.
+create or replace function public.transcriber_find_live_job(p_object_path text)
+returns jsonb
+language sql
+stable
+set search_path = public
+as $$
+  select to_jsonb(j) from public.transcription_jobs j
+  where object_path = p_object_path and status not in ('failed', 'rejected')
+  order by id desc
+  limit 1;
+$$;
+
+-- Today's jobs whose real length Speechmatics has not told us yet.
+create or replace function public.transcriber_jobs_without_length(p_time_zone text)
+returns jsonb
+language sql
+stable
+set search_path = public
+as $$
+  select coalesce(jsonb_agg(speechmatics_id), '[]'::jsonb)
+  from (
+    select speechmatics_id from public.transcription_jobs
+    where day = (now() at time zone p_time_zone)::date
+      and speechmatics_id is not null
+      and duration_seconds is null
+      and status not in ('failed', 'rejected')
+    order by id desc
+    limit 25
+  ) j;
+$$;
+
 -- A job the app started, found by its Speechmatics job number (null if not ours).
 create or replace function public.transcriber_find_job(p_speechmatics_id text)
 returns jsonb
@@ -188,12 +221,16 @@ revoke execute on function public.transcriber_begin_job(text, integer, integer, 
 revoke execute on function public.transcriber_job_started(bigint, text) from public, anon, authenticated;
 revoke execute on function public.transcriber_job_failed(bigint, text) from public, anon, authenticated;
 revoke execute on function public.transcriber_find_job(text) from public, anon, authenticated;
+revoke execute on function public.transcriber_find_live_job(text) from public, anon, authenticated;
+revoke execute on function public.transcriber_jobs_without_length(text) from public, anon, authenticated;
 revoke execute on function public.transcriber_job_update(text, text, integer, boolean) from public, anon, authenticated;
 grant execute on function public.transcriber_used_seconds(text) to service_role;
 grant execute on function public.transcriber_begin_job(text, integer, integer, text) to service_role;
 grant execute on function public.transcriber_job_started(bigint, text) to service_role;
 grant execute on function public.transcriber_job_failed(bigint, text) to service_role;
 grant execute on function public.transcriber_find_job(text) to service_role;
+grant execute on function public.transcriber_find_live_job(text) to service_role;
+grant execute on function public.transcriber_jobs_without_length(text) to service_role;
 grant execute on function public.transcriber_job_update(text, text, integer, boolean) to service_role;
 
 -- Let the Data API see the new table and functions straight away.

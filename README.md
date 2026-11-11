@@ -91,7 +91,9 @@ To protect the Speechmatics account, the Edge Functions refuse new jobs once
 **60 minutes** of audio have been sent to Speechmatics in one day (all users
 together, Philippine time). The app checks before it prepares or uploads
 anything and shows a plain message. A job that starts under the limit runs to
-the end. Jobs Speechmatics refuses are not counted.
+the end. Jobs Speechmatics refuses are not counted. Minutes are counted from the
+length the server reads from the uploaded file and the length Speechmatics
+reports, not from what the page says.
 
 To change the 60: edit `DAILY_LIMIT_MINUTES` in
 [`supabase/functions/_shared/settings.js`](supabase/functions/_shared/settings.js),

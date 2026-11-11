@@ -66,6 +66,8 @@
         ' minutes of recordings a day to Speechmatics (for everyone together), and that has been reached. Please try again tomorrow.';
     },
     notSetUp: 'The transcription service is not set up yet. Please try again later.',
+    busy: 'This recording is still being handed to Speechmatics. Wait a few minutes, then tap Continue Transcribing. It will not be sent twice.',
+    expired: 'Speechmatics no longer keeps the transcript of this recording (it keeps them for about a week). Tap Try Again to transcribe it again; this uses today’s minutes.',
     server: 'Something went wrong on the transcription server. Wait a minute, then tap Continue Transcribing.',
     storage: 'Progress could not be saved on this device, so if the app closes it may have to start again.',
     needFile: function (name) {
@@ -298,16 +300,14 @@
       return global.CloudStore.latestUnfinished();
     }).then(function (job) {
       if (!job || self.file || self.running) return;
-      if (job.stage === 'processing' && job.jobId) {
-        // Speechmatics already has it: collect the transcript, no file needed.
-        if (self.job && self.job.done && self.job.key !== job.key && self._hasText()) {
-          self.message(MESSAGES.interrupted(job.name), 'warn');
-          return;
-        }
+      if ((job.stage === 'processing' && job.jobId) || (job.stage === 'uploaded' && job.objectPath && !job.failed)) {
+        // The sound is already uploaded or with Speechmatics: carry on and collect the
+        // transcript, no file needed. (A transcript that was on screen stays saved: choosing
+        // its file again shows it.)
         self.key = job.key;
         self.job = job;
         self._restoredName = job.name;
-        self._showResume('Speechmatics is working on “' + job.name + '”. Its transcript will appear below when it is ready.', false);
+        self._showResume('Carrying on with “' + job.name + '”. Its transcript will appear below when it is ready.', false);
         self.start();
         return;
       }
@@ -336,6 +336,8 @@
     var done = function () { delete self._deleting[job.jobId]; };
     this._deleting[job.jobId] = global.CloudApi.deleteAudio(job.jobId).then(function () {
       job.audioDeleted = true;
+      // The one on screen: save it as it is now (keeping any renames or corrections).
+      if (self.job && self.job.key === job.key) { self.job.audioDeleted = true; return self._saveJob(); }
       return global.CloudStore.getJob(job.key).then(function (saved) {
         if (saved) { saved.audioDeleted = true; return global.CloudStore.putJob(saved); }
       });
@@ -657,11 +659,24 @@
       self._showFileInfo();
       self._render();
       self._saveState();
+      if (job && job.pruned && job.jobId) {
+        // An old transcript removed from this device to save space: collect it again (free).
+        job.done = false;
+        job.pruned = false;
+        job.stage = 'processing';
+        self._showResume('This file was transcribed before. Collecting its transcript again from Speechmatics (no extra cost).', false);
+        return self.start();
+      }
       if (job && job.done) {
         self._showResume('This file was already transcribed. Its saved transcript is below, so it was not sent again.', false);
         self.message('Already transcribed.', 'done');
         self._progress(null);
         self._updateStartButton();
+        return;
+      }
+      if (job && job.failed) {
+        self._updateStartButton();
+        self.message('Speechmatics could not transcribe this recording last time. Tap Try Again to send it again.', 'warn');
         return;
       }
       if (job && job.stage && job.stage !== 'new') {
@@ -701,6 +716,8 @@
     if (this.running || this._choosing || !this.job || this.job.done) return Promise.resolve();
     var job = this.job;
     var run = ++this._run;
+    // Ask Chrome not to clear this app's saved progress when space runs low.
+    if (global.navigator.storage && global.navigator.storage.persist) global.navigator.storage.persist().catch(function () {});
     this.cancelled = false;
     job.failed = false;
     this._setCancellable(job.stage === 'new' || job.stage === 'uploading');
@@ -847,6 +864,7 @@
     var self = this;
     this._setCancellable(false);
     this.els.cancel.hidden = true;
+    this.els.startOver.hidden = true;   // uploaded: starting over now could pay twice
     this.message('Sending to Speechmatics…');
     this._progress('busy');
     var tries = 0;
@@ -902,13 +920,14 @@
       return global.CloudApi.jobStatus(job.jobId).then(function (s) {
         if (s.status === 'done') return true;
         if (s.status === 'failed') {
+          if (s.speechmaticsStatus === 'expired' || s.speechmaticsStatus === 'deleted') throw TabError('expired');
           throw TabError('rejected', { why: (s.errors && s.errors[0]) || '' });
         }
         show();
         return false;
       }, function (err) {
-        if (err.code === 'offline' || err.code === 'network' || err.code === 'server') {
-          self.message(err.code === 'offline' ? MESSAGES.offlineChecking : 'Lost touch with the transcription service. Trying again…', 'warn');
+        if (err.code === 'offline' || err.code === 'network' || err.code === 'server' || err.code === 'speechmatics') {
+          self.message(err.code === 'offline' ? MESSAGES.offlineChecking : 'Lost touch with Speechmatics for a moment. Trying again…', 'warn');
           return false;
         }
         throw err;
@@ -929,7 +948,7 @@
     var tries = 0;
     function attempt() {
       return global.CloudApi.jobResult(job.jobId).catch(function (err) {
-        if (['offline', 'network', 'server', 'notReady'].indexOf(err.code) !== -1 && tries++ < 1000 && stillMine()) {
+        if (['offline', 'network', 'server', 'notReady', 'speechmatics'].indexOf(err.code) !== -1 && tries++ < 1000 && stillMine()) {
           if (err.code === 'offline') self.message(MESSAGES.offlineChecking, 'warn');
           return wait(err.code === 'notReady' ? TIMING.busy : TIMING.retry).then(attempt);
         }
@@ -995,7 +1014,9 @@
   /** Throw away the saved progress for this file (before Speechmatics has it) and start again. */
   FileTab.prototype.startOver = function () {
     var self = this;
-    if (this._choosing || !this.job || (this.job.stage === 'processing')) return Promise.resolve();
+    // Only before Speechmatics has the recording: after that, starting over would pay twice.
+    var canStartOver = function () { return self.job && (self.job.stage === 'new' || self.job.stage === 'uploading'); };
+    if (this._choosing || !canStartOver()) return Promise.resolve();
     var wait1 = Promise.resolve();
     if (this.running) {
       this.cancel();
@@ -1003,8 +1024,14 @@
     }
     this.els.startOver.disabled = true;
     return wait1.then(function () {
+      if (!canStartOver()) {
+        self.els.startOver.disabled = false;
+        self.els.startOver.hidden = true;
+        return 'too late';
+      }
       return global.CloudStore.deleteJob(self.key).catch(function () {});
-    }).then(function () {
+    }).then(function (tooLate) {
+      if (tooLate) return;
       self.els.startOver.disabled = false;
       self._showResume('');
       self._hasCompactAudio = false;
@@ -1027,12 +1054,17 @@
       case 'uploadDenied': text = MESSAGES.uploadDenied; break;
       case 'dailyLimit': text = MESSAGES.dailyLimit(err.limitMinutes); break;
       case 'speechmatics': text = MESSAGES.speechmatics; if (job) job.failed = true; break;
+      case 'expired':
+        text = MESSAGES.expired;
+        if (job) { job.failed = true; job.stage = 'uploaded'; job.jobId = null; this._saveJob(job); }
+        break;
       case 'rejected':
         text = MESSAGES.rejected(err.why);
         if (job) { job.failed = true; job.stage = 'uploaded'; job.jobId = null; this._saveJob(job); }
         break;
       case 'notSetUp': text = MESSAGES.notSetUp; break;
-      case 'server': case 'busy': case 'badRequest': case 'unknownJob': text = MESSAGES.server; break;
+      case 'busy': text = MESSAGES.busy; kind = 'warn'; break;
+      case 'server': case 'badRequest': case 'unknownJob': text = MESSAGES.server; break;
       case 'needFile': text = MESSAGES.needFile(this.fileName()); kind = 'warn'; break;
       case 'unsupported':
         // From the converter: this browser has no Opus encoder. Otherwise: the file type.

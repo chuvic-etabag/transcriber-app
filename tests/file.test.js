@@ -65,6 +65,7 @@ function freshServer() {
     limitReached: false,
     limitAtStart: false,
     startFails: 0,             // how many start-job calls answer "Speechmatics failed"
+    startBusy: 0,              // how many start-job calls answer "busy"
     reject: null,              // a reason to reject the next job
     notDeployed: false,
     patchFails: 0,             // how many PATCH requests answer 500
@@ -149,6 +150,7 @@ async function fakeSupabase(route) {
     if (fn === 'start-job') {
       if (server.limitReached || server.limitAtStart) return limit();
       if (!server.objects.has(body.path)) return reply(404, { error: 'notUploaded', message: 'not uploaded' });
+      if (server.startBusy > 0) { server.startBusy--; return reply(409, { error: 'busy', message: 'busy' }); }
       if (server.startFails > 0) { server.startFails--; return reply(502, { error: 'speechmatics', message: 'Speechmatics could not take this job right now.' }); }
       const existing = [...server.jobs.entries()].find(([, j]) => j.path === body.path && j.status !== 'rejected');
       if (existing) return reply(200, { jobId: existing[0], reused: true });
@@ -684,7 +686,94 @@ const expectedText = (result, names = {}, times = true) => {
       assert.strictEqual(fnCalls('start-job').length, 1);
     });
 
+    await test('Start Over is gone once the upload is done, so it can never pay twice', async (page) => {
+      server.pollsUntilDone = 1000;
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /Speechmatics is transcribing/);
+      assert.ok(!(await page.isVisible('#file-start-over')));
+      await page.evaluate(() => window.transcriberApp.file.startOver());
+      await page.waitForTimeout(500);
+      assert.strictEqual(fnCalls('start-job').length, 1);
+      assert.strictEqual(server.uploads.size, 1);
+      [...server.jobs.values()][0].polls = 5000;
+      await waitStatus(page, /^Done/);
+    });
+
+    await test('closed after uploading but before Speechmatics took it: reopening carries on by itself', async (page, context) => {
+      server.limitAtStart = true;
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /^Today’s transcription time is used up/);
+      await page.close({ runBeforeUnload: false });
+      server.limitAtStart = false;   // the next day
+      const again = await context.newPage();
+      await again.goto(URL);
+      await openFileTab(again);
+      await waitStatus(again, /^Done/);
+      assert.strictEqual(server.uploads.size, 1, 'not uploaded again');
+      assert.strictEqual(fnCalls('start-job').length, 2);
+      assert.strictEqual(server.jobs.size, 1, 'one Speechmatics job');
+    });
+
+    await test('a recording Speechmatics refused is not sent again just by choosing it', async (page) => {
+      server.reject = 'No speech found';
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /it said: “No speech found”/);
+      await page.reload();
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /could not transcribe this recording last time\. Tap Try Again/);
+      await page.waitForTimeout(400);
+      assert.strictEqual(fnCalls('start-job').length, 1);
+      assert.strictEqual(await text(page, '#file-start-label'), 'Try Again');
+      await page.click('#file-start');
+      await waitStatus(page, /^Done/);
+      assert.strictEqual(fnCalls('start-job').length, 2);
+    });
+
+    await test('an old transcript removed to save space is collected again from Speechmatics, not paid again', async (page) => {
+      await transcribe(page, files.jfk, { result: saved('two-speakers') });
+      await page.evaluate(async () => {
+        const store = window.CloudStore;
+        const jobs = await store.allJobs();
+        for (const j of jobs) { delete j.turns; j.done = false; j.pruned = true; j.stage = 'processing'; await store.putJob(j); }
+      });
+      const checks = fnCalls('job-status').length;
+      await page.reload();
+      await openFileTab(page);
+      await page.waitForTimeout(400);
+      assert.strictEqual(fnCalls('job-status').length, checks, 'not collected by itself at start-up');
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Done/);
+      assert.match(await text(page, '#file-resume-text'), /^$/);
+      assert.deepStrictEqual(await screenLines(page), expectedText(saved('two-speakers')).split('\n'));
+      assert.strictEqual(fnCalls('start-job').length, 1, 'no new job');
+      assert.strictEqual(server.uploads.size, 1);
+    });
+
     console.log('Problems, in plain words');
+
+    await test('still being handed to Speechmatics ("busy"): plain message, not sent twice', async (page) => {
+      server.startBusy = 1000;
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /^This recording is still being handed to Speechmatics\. Wait a few minutes.*will not be sent twice/, 30000);
+      server.startBusy = 0;
+      await page.click('#file-start');
+      await waitStatus(page, /^Done/);
+      assert.strictEqual(server.jobs.size, 1);
+    });
+
 
     await test('no internet: says so, and works once back online', async (page, context) => {
       await openFileTab(page);

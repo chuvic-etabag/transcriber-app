@@ -154,11 +154,15 @@
 
   OggWriter.prototype.add = function (packet, samples48k) {
     // A full page goes out only once another packet arrives, so the last page always has packets.
-    if (this.pending.length >= PACKETS_PER_PAGE) {
+    var lacing = Math.floor(packet.length / 255) + 1;
+    // An Ogg page holds at most 255 lacing values.
+    if (this.pending.length && (this.pending.length >= PACKETS_PER_PAGE || this.lacing + lacing > 255)) {
       this._write(oggPage(this.pending, this.granule, this.serial, this.sequence++, 0));
       this.pending = [];
+      this.lacing = 0;
     }
     this.pending.push(packet);
+    this.lacing = (this.lacing || 0) + lacing;
     this.granule += samples48k;
   };
 

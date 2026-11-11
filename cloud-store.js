@@ -18,7 +18,7 @@
 
   var DB_NAME = 'transcriber-cloud';
   var DB_VERSION = 1;
-  var KEEP_DONE = 30;   // older finished transcripts are removed to save space
+  var KEEP_DONE = 50;   // older finished transcripts are removed to save space (the small record stays)
   var dbPromise = null;
 
   function request(req) {
@@ -134,17 +134,28 @@
   /** The most recently worked-on file that is not finished, if any. */
   function latestUnfinished() {
     return allJobs().then(function (jobs) {
-      return jobs.filter(function (j) { return !j.done && j.stage && j.stage !== 'new'; })
+      return jobs.filter(function (j) { return !j.done && !j.pruned && j.stage && j.stage !== 'new'; })
         .sort(function (a, b) { return b.updatedAt - a.updatedAt; })[0] || null;
     });
   }
 
-  /** Keep the newest KEEP_DONE finished transcripts; remove older ones. */
+  /**
+   * Keep the newest KEEP_DONE finished transcripts. Older ones lose their text but keep
+   * the small record with the Speechmatics job number, so choosing that file again
+   * collects the transcript again instead of paying for it twice.
+   */
   function prune() {
     return allJobs().then(function (jobs) {
       var finished = jobs.filter(function (j) { return j.done; })
         .sort(function (a, b) { return b.updatedAt - a.updatedAt; });
-      return Promise.all(finished.slice(KEEP_DONE).map(function (j) { return deleteJob(j.key); }));
+      return Promise.all(finished.slice(KEEP_DONE).map(function (j) {
+        if (!j.jobId) return deleteJob(j.key);
+        delete j.turns;
+        j.done = false;
+        j.pruned = true;
+        j.stage = 'processing';
+        return putJob(j);
+      }));
     });
   }
 

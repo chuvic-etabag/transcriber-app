@@ -99,7 +99,8 @@ Tell me the message on the screen and what the log says.
   file. (Otherwise a 3-hour recording could never be transcribed with a 60-minute limit.) If you
   want a hard cap instead ("refuse a file that would go past 60"), tell me. "One day" is Philippine
   time (midnight to midnight). Jobs Speechmatics refuses are not counted. The minutes are counted
-  from the length Speechmatics measures, not just what the page says.
+  from the length the server reads from the uploaded file and the length Speechmatics measures,
+  never just what the web page says, so the limit can't be cheated from outside the app.
 - **Disfluencies:** Speechmatics keeps "um", "uh", "mhm" unless it is asked to remove them, so the
   app simply never asks. Word timings are always included by Speechmatics; there is no setting.
 - **Speechmatics address:** the functions use `https://asr.api.speechmatics.com/v2` (the standard
@@ -111,8 +112,13 @@ Tell me the message on the screen and what the log says.
   still shown (and can be copied or cleared) until you transcribe a new file.
 - **Files left on the server:** uploads that never became a transcript (for example a file you
   gave up on) are deleted after 24 hours, the next time anyone starts a job.
-- **Speechmatics keeps its own copy of each finished job for a while** (its normal retention). The
-  app does not delete jobs at Speechmatics. Tell me if you want that.
+- **Speechmatics keeps its own copy of each finished job for about a week** (its normal retention).
+  The app does not delete jobs at Speechmatics. This device keeps the 50 newest transcripts; for
+  older ones it keeps the job number, so choosing that file again collects the transcript from
+  Speechmatics for free while Speechmatics still has it.
+- **If the answer from Speechmatics is lost** while a job is being started (for example the
+  internet drops at that exact moment), the app waits up to 10 minutes before allowing that
+  recording to be sent again, so it is never paid for twice. It says so in plain words.
 
 ## Could Not Check From Here
 

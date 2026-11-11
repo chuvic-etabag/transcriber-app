@@ -170,6 +170,27 @@ async function deleteUnusedUploads() {
   return removeFiles(old);
 }
 
+/**
+ * The length of an uploaded Ogg Opus file, read from its last page (the server's own
+ * measure, so the daily limit doesn't rely on what the page says). null if unknown.
+ */
+async function oggSeconds(url) {
+  try {
+    const res = await fetch(url, { headers: { Range: 'bytes=-65536' } });
+    if (!res.ok) return null;
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    for (let i = bytes.length - 27; i >= 0; i--) {
+      if (bytes[i] === 0x4f && bytes[i + 1] === 0x67 && bytes[i + 2] === 0x67 && bytes[i + 3] === 0x53) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset + i);
+        const granule = view.getUint32(6, true) + view.getUint32(10, true) * 4294967296;
+        if (!granule || granule > 48000 * 86400) return null;
+        return Math.max(0, Math.round((granule - 312) / 48000));
+      }
+    }
+  } catch (_) { /* unknown */ }
+  return null;
+}
+
 // ---------- Speechmatics ----------
 
 async function speechmatics(path, init) {
@@ -220,6 +241,24 @@ function slimResult(result) {
   return { format: result.format, job: result.job, metadata: result.metadata, results };
 }
 
+/**
+ * Ask Speechmatics the real length of today's jobs that nobody has checked on yet,
+ * so a job counts in full towards the daily limit even if its page never asks again.
+ */
+async function refreshLengths() {
+  let ids = [];
+  try { ids = (await rpc('transcriber_jobs_without_length', { p_time_zone: TIME_ZONE })) || []; } catch (_) { return; }
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const answer = await speechmatics(`/jobs/${encodeURIComponent(id)}`, { method: 'GET' });
+      const duration = seconds(answer && answer.job && answer.job.duration);
+      if (duration !== null) {
+        await rpc('transcriber_job_update', { p_speechmatics_id: id, p_status: null, p_duration_seconds: duration, p_audio_deleted: null });
+      }
+    } catch (_) { /* try again next time */ }
+  }));
+}
+
 // ---------- The functions ----------
 
 async function handle(req, work) {
@@ -245,6 +284,7 @@ async function findJob(jobId) {
 /** check-limit: is there time left today? (The app asks before it uploads.) */
 export function checkLimit(req) {
   return handle(req, async () => {
+    await refreshLengths();
     const used = Number(await rpc('transcriber_used_seconds', { p_time_zone: TIME_ZONE })) || 0;
     const limit = DAILY_LIMIT_MINUTES * 60;
     if (used >= limit) {
@@ -261,8 +301,12 @@ export function startJob(req) {
     if (typeof path !== 'string' || !UPLOAD_PATH.test(path)) {
       return refuse(req, 400, 'badRequest', 'That is not an upload from this app.');
     }
-    let seconds = Math.round(Number(body.seconds));
-    if (!isFinite(seconds) || seconds < 0) seconds = 0;
+    let claimed = Math.round(Number(body.seconds));
+    if (!isFinite(claimed) || claimed < 0) claimed = 0;
+
+    // Already sent to Speechmatics? Hand back that job (even if the upload has since been cleared).
+    const live = await rpc('transcriber_find_live_job', { p_object_path: path });
+    if (live && live.speechmatics_id) return reply(req, 200, { jobId: live.speechmatics_id, reused: true });
 
     const file = await storedFile(path);
     if (!file) return refuse(req, 404, 'notUploaded', 'The recording has not finished uploading.');
@@ -272,9 +316,12 @@ export function startJob(req) {
       return refuse(req, 413, 'tooLarge', 'The recording is too large.');
     }
 
+    const url = await signedUrl(path);
+    const measured = await oggSeconds(url);
+    await refreshLengths();
     const begun = await rpc('transcriber_begin_job', {
       p_object_path: path,
-      p_seconds: seconds,
+      p_seconds: Math.max(claimed, measured || 0),
       p_limit_seconds: DAILY_LIMIT_MINUTES * 60,
       p_time_zone: TIME_ZONE
     });
@@ -286,23 +333,36 @@ export function startJob(req) {
 
     deleteUnusedUploads().catch((err) => console.error('Cleaning old uploads:', err && err.message));
 
+    let created;
     try {
-      const url = await signedUrl(path);
       const form = new FormData();
       form.append('config', JSON.stringify({
         type: 'transcription',
         fetch_data: { url },
         transcription_config: TRANSCRIPTION_CONFIG
       }));
-      const created = await speechmatics('/jobs', { method: 'POST', body: form });
-      if (!created || !created.id) throw new ServiceError('speechmatics', 'Speechmatics gave no job number');
-      await rpc('transcriber_job_started', { p_id: begun.id, p_speechmatics_id: String(created.id) });
-      return reply(req, 200, { jobId: String(created.id) });
+      created = await speechmatics('/jobs', { method: 'POST', body: form });
+      if (!created || !created.id) throw new ServiceError('speechmatics', 'Speechmatics gave no job number', 400);
     } catch (err) {
-      // Nothing was started, so it doesn't count towards today's limit.
-      await rpc('transcriber_job_failed', { p_id: begun.id, p_error: String(err && err.message) }).catch(() => {});
+      // Only when Speechmatics clearly said no is the job marked failed (and not counted).
+      // If the answer was lost, it may have started the job: the row stays "starting", so a
+      // retry within 10 minutes gets "busy" instead of starting (and paying for) a second job.
+      if (err.code === 'notSetUp' || (err.status >= 400 && err.status < 500)) {
+        await rpc('transcriber_job_failed', { p_id: begun.id, p_error: String(err && err.message) }).catch(() => {});
+      }
       throw err;
     }
+    const jobId = String(created.id);
+    for (let i = 0; ; i++) {
+      try {
+        await rpc('transcriber_job_started', { p_id: begun.id, p_speechmatics_id: jobId });
+        break;
+      } catch (err) {
+        if (i >= 2) throw err;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    return reply(req, 200, { jobId });
   });
 }
 
@@ -366,3 +426,6 @@ export function deleteAudio(req) {
     return reply(req, 200, { deleted: true });
   });
 }
+
+// For the tests.
+export { oggSeconds as _oggSeconds };

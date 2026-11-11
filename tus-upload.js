@@ -24,6 +24,8 @@
 
   var CHUNK = 6 * 1024 * 1024;            // Supabase needs exactly 6 MB pieces
   var SERVER_RETRIES = 6;                  // server problems: try this many times, then give up
+  var ONLINE_NETWORK_RETRIES = 20;         // no answer while the phone says it is online: then give up
+  var REQUEST_TIMEOUT_MS = 5 * 60 * 1000;  // a 6 MB piece that takes longer than this has stalled
   var WAITS = [1000, 2000, 4000, 8000, 15000, 30000];
 
   function UploadError(code, detail, status) {
@@ -65,6 +67,7 @@
       var xhr = new global.XMLHttpRequest();
       self.xhr = xhr;
       xhr.open(method, url, true);
+      xhr.timeout = REQUEST_TIMEOUT_MS;
       var all = Object.assign({ 'Tus-Resumable': '1.0.0' }, self.opts.headers || {}, headers || {});
       Object.keys(all).forEach(function (k) { xhr.setRequestHeader(k, all[k]); });
       if (onUpload && xhr.upload) xhr.upload.onprogress = function (e) { onUpload(e.loaded); };
@@ -106,6 +109,14 @@
       'Upload-Metadata': metadata,
       'x-upsert': 'false'
     }).then(function (xhr) {
+      if (xhr.status === 409 || /already exists/i.test(xhr.responseText || '')) {
+        // The file is already there: the last piece reached the server but its answer was lost.
+        // (The Edge Function checks the file exists before sending it to Speechmatics.)
+        self.offset = self.blob.size;
+        self.url = self.url || 'done';
+        self._save();
+        return;
+      }
       if (xhr.status !== 201 && xhr.status !== 200) throw problem(xhr);
       var location = xhr.getResponseHeader('Location');
       if (!location) throw UploadError('failed', 'No upload link in the answer');
@@ -167,7 +178,8 @@
     var networkTries = 0;
     var serverTries = 0;
     var restarted = false;
-    var needHead = Boolean(this.url);
+    var needHead = Boolean(this.url) && this.url !== 'done';
+    if (this.url === 'done') this.offset = this.blob.size;   // finished before (see _create)
 
     function step() {
       if (self.stopped) return Promise.reject(UploadError('stopped'));
@@ -199,13 +211,18 @@
           needHead = true;
           serverTries++;
           if (serverTries > SERVER_RETRIES) throw UploadError('failed', err.message, err.status);
-          return step();
+          return self._wait(ResumableUpload.WAITS[0]).then(step);
         }
         if (err.code === 'network') {
           // No answer at all: usually the internet is down. Keep waiting until it comes back.
           if (self.opts.onWaiting) self.opts.onWaiting(global.navigator.onLine === false || networkTries >= 1 ? 'offline' : 'retrying');
           var wait = ResumableUpload.WAITS[Math.min(networkTries, ResumableUpload.WAITS.length - 1)];
           networkTries++;
+          // Online but never an answer (for example the server refusing without a proper reply):
+          // don't say "no internet" forever.
+          if (global.navigator.onLine !== false && networkTries > ONLINE_NETWORK_RETRIES) {
+            throw UploadError('failed', 'No answer from the server', 0);
+          }
           needHead = Boolean(self.url);
           return self._wait(wait).then(step);
         }

@@ -122,7 +122,8 @@ async function fakeFetch(input, init = {}) {
   calls.push({ method, url: url.href, headers: Object.fromEntries(headers), body: init.body });
 
   if (url.origin === SUPABASE_URL) {
-    assert.strictEqual(headers.get('apikey'), 'service-role-key', 'uses the service key');
+    const signedGet = method === 'GET' && url.pathname.startsWith('/storage/v1/object/sign/');
+    if (!signedGet) assert.strictEqual(headers.get('apikey'), 'service-role-key', 'uses the service key');
     if (url.pathname.startsWith('/rest/v1/rpc/')) return rpcCall(url.pathname.split('/').pop(), JSON.parse(init.body));
     if (url.pathname === '/storage/v1/object/list/recordings') {
       const q = JSON.parse(init.body);
@@ -130,6 +131,14 @@ async function fakeFetch(input, init = {}) {
         .filter(([p]) => p.startsWith(q.prefix + '/') && (!q.search || p.slice(q.prefix.length + 1).includes(q.search)))
         .map(([p, o]) => ({ name: p.slice(q.prefix.length + 1), id: 'id-' + p, created_at: o.created_at, metadata: { size: o.size, mimetype: 'audio/ogg' } }));
       return json(200, rows.slice(0, q.limit || 100));
+    }
+    if (url.pathname.startsWith('/storage/v1/object/sign/recordings/') && method === 'GET') {
+      // Speechmatics (or the function) fetching the file through the signed link.
+      const o = storage.get(url.pathname.slice('/storage/v1/object/sign/recordings/'.length));
+      if (!o || !o.bytes || url.searchParams.get('token') !== 'signed-token') return json(400, { error: 'not found' });
+      const range = /bytes=-(\d+)/.exec(headers.get('range') || '');
+      const body = range ? o.bytes.subarray(Math.max(0, o.bytes.length - Number(range[1]))) : o.bytes;
+      return new Response(body, { status: range ? 206 : 200 });
     }
     if (url.pathname.startsWith('/storage/v1/object/sign/recordings/')) {
       const p = url.pathname.slice('/storage/v1/object/sign/recordings/'.length);
@@ -185,11 +194,22 @@ const ask = async (fn, body, { origin = PAGE, method = 'POST' } = {}) => {
   return { status: res.status, body: text && text !== 'ok' ? JSON.parse(text) : text, headers: res.headers };
 };
 const uuid = () => crypto.randomUUID();
-const upload = (minutesOld = 0, size = 3_000_000) => {
+const upload = (minutesOld = 0, size = 3_000_000, bytes = null) => {
   const p = `uploads/${uuid()}.ogg`;
-  storage.set(p, { size, created_at: new Date(Date.now() - minutesOld * 60000).toISOString() });
+  storage.set(p, { size, bytes, created_at: new Date(Date.now() - minutesOld * 60000).toISOString() });
   return p;
 };
+/** The end of an Ogg Opus file of this many seconds (its last page carries the length). */
+function oggTail(secondsLong) {
+  const page = Buffer.alloc(27 + 1 + 60);
+  page.write('OggS', 0, 'latin1');
+  page[5] = 4;
+  const granule = 312 + secondsLong * 48000;
+  page.writeUInt32LE(granule % 4294967296, 6);
+  page.writeUInt32LE(Math.floor(granule / 4294967296), 10);
+  page[26] = 1; page[27] = 60;
+  return Buffer.concat([Buffer.alloc(5000, 7), page]);
+}
 const smCreates = () => calls.filter((c) => c.method === 'POST' && c.url === 'https://asr.api.speechmatics.com/v2/jobs').length;
 const resetDay = () => sql('delete from public.transcription_jobs;');
 
@@ -437,6 +457,46 @@ try {
     await ask('jobStatus', { jobId: id });
     assert.strictEqual((await ask('checkLimit')).status, 429);
     assert.strictEqual((await ask('startJob', { path: upload(), seconds: 10 })).status, 429);
+  });
+
+  await test('daily limit uses the real length of the upload, even if the page claims 0 seconds and never checks back', async () => {
+    resetDay();
+    const r = await ask('startJob', { path: upload(0, 3_000_000, oggTail(61 * 60)), seconds: 0 });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual((await ask('checkLimit')).status, 429, 'the 61 minutes measured on the server count');
+  });
+
+  await test('daily limit asks Speechmatics about jobs nobody checked on', async () => {
+    resetDay();
+    const id = (await ask('startJob', { path: upload(), seconds: 10 })).body.jobId;
+    sm.jobs.get(id).duration = 3700;           // never polled by the page
+    const c = await ask('checkLimit');
+    assert.strictEqual(c.status, 429);
+    assert.strictEqual((await ask('startJob', { path: upload(), seconds: 10 })).status, 429);
+  });
+
+  await test('start-job for an upload already sent hands back the job even after the upload was cleared', async () => {
+    resetDay();
+    const p = upload();
+    const first = (await ask('startJob', { path: p, seconds: 30 })).body.jobId;
+    storage.delete(p);
+    const again = await ask('startJob', { path: p, seconds: 30 });
+    assert.strictEqual(again.status, 200);
+    assert.strictEqual(again.body.jobId, first);
+    assert.strictEqual(again.body.reused, true);
+  });
+
+  await test('Speechmatics answer lost (server error): no second job on retry, "busy" instead', async () => {
+    resetDay();
+    const p = upload();
+    const before = smCreates();
+    sm.failCreate = { status: 503, body: { error: 'Service Unavailable' } };
+    const r = await ask('startJob', { path: p, seconds: 30 });
+    assert.strictEqual(r.status, 502);
+    const again = await ask('startJob', { path: p, seconds: 30 });
+    assert.strictEqual(again.status, 409);
+    assert.strictEqual(again.body.error, 'busy');
+    assert.strictEqual(smCreates(), before + 1);
   });
 
   await test('daily limit: only today counts (yesterday\'s minutes are not counted)', async () => {
