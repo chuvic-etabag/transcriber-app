@@ -317,7 +317,6 @@ $$;
 revoke execute on function public.transcriber_email_allowed(text) from public;
 revoke execute on function public.transcriber_user_allowed(uuid) from public, anon, authenticated;
 revoke execute on function public.transcriber_is_allowed() from public, anon;
-revoke execute on function public.transcriber_check_new_user() from public, anon, authenticated;
 revoke execute on function public.transcriber_storage_used() from public, anon;
 revoke execute on function public.transcriber_begin_user_job(uuid, text, integer, integer, text) from public, anon, authenticated;
 revoke execute on function public.transcriber_audio_kept(text) from public, anon, authenticated;
