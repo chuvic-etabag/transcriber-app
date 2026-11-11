@@ -2,6 +2,10 @@
 // hands its requests to one of these. Kept in one file so the tests can call
 // them directly (tests/functions.test.mjs).
 //
+// Every function first checks who is asking: the request must carry the sign-in
+// token of a person whose email is on the allowed list (supabase/setup_2.sql).
+// Without it nothing is read, uploaded, sent to Speechmatics or deleted.
+//
 // Secrets come from the Edge Function environment and never reach the browser:
 //   SPEECHMATICS_API_KEY        (added by Chu as an Edge Function secret)
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  (provided by Supabase automatically)
@@ -17,7 +21,12 @@ import {
   TRANSCRIPTION_CONFIG
 } from './settings.js';
 
-const UPLOAD_PATH = /^uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.ogg$/;
+// A recording is uploaded into its owner's folder: <user id>/<random id>.ogg
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const USER_ID = new RegExp(`^${UUID}$`);
+const FILE_NAME = new RegExp(`^${UUID}\\.ogg$`);
+// Uploads from before sign-in existed (TR Session C) are in uploads/.
+const OLD_UPLOAD_PATH = new RegExp(`^uploads/${UUID}\\.ogg$`);
 const JOB_ID = /^[A-Za-z0-9_-]{4,64}$/;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
@@ -156,18 +165,41 @@ async function removeFiles(paths) {
   return JSON.parse(text || '[]');
 }
 
-/** Delete uploads older than a day that never became a transcript (the app was abandoned). */
+/**
+ * Delete uploads that never finished becoming a transcript: older than a day, not kept
+ * by a saved transcript, and with no Speechmatics job that could still be collected.
+ * Recordings of saved transcripts are never touched; they stay until their owner deletes them.
+ */
 async function deleteUnusedUploads() {
-  const res = await fetch(`${env('SUPABASE_URL')}/storage/v1/object/list/${BUCKET}`, {
-    method: 'POST',
-    headers: supabaseHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ prefix: 'uploads', limit: 100, offset: 0, sortBy: { column: 'created_at', order: 'asc' } })
-  });
-  if (!res.ok) return [];
-  const rows = await res.json();
-  const before = Date.now() - DELETE_UNUSED_UPLOADS_AFTER_HOURS * 3600 * 1000;
-  const old = rows.filter((r) => r.id && r.created_at && Date.parse(r.created_at) < before).map((r) => `uploads/${r.name}`);
+  const old = (await rpc('transcriber_abandoned_uploads', { p_hours: DELETE_UNUSED_UPLOADS_AFTER_HOURS })) || [];
   return removeFiles(old);
+}
+
+// ---------- Who is asking ----------
+
+/** The signed-in person behind this request ({ id, email }), or null. */
+async function signedInUser(req) {
+  const header = req.headers.get('authorization') || '';
+  const token = header.replace(/^Bearer\s+/i, '').trim();
+  // The page's publishable key is not a person.
+  if (!token || token.startsWith('sb_') || token.split('.').length !== 3) return null;
+  const res = await fetch(`${env('SUPABASE_URL')}/auth/v1/user`, {
+    headers: { apikey: serviceKey(), Authorization: `Bearer ${token}` }
+  });
+  if (res.status >= 500) throw new ServiceError('auth', `Could not check the sign-in: ${res.status}`, res.status);
+  if (!res.ok) return null;
+  let user = null;
+  try { user = await res.json(); } catch (_) { user = null; }
+  if (!user || typeof user.id !== 'string' || !USER_ID.test(user.id)) return null;
+  return { id: user.id, email: user.email || '' };
+}
+
+/** Is this the path of a recording this person uploaded? */
+function ownUpload(path, user) {
+  if (typeof path !== 'string') return false;
+  if (OLD_UPLOAD_PATH.test(path)) return true;
+  const slash = path.indexOf('/');
+  return path.slice(0, slash) === user.id && FILE_NAME.test(path.slice(slash + 1));
 }
 
 /**
@@ -268,7 +300,12 @@ async function handle(req, work) {
     return refuse(req, 403, 'origin', 'This page is not allowed to use the transcription service.');
   }
   try {
-    return await work(await readJson(req));
+    const user = await signedInUser(req);
+    if (!user) return refuse(req, 401, 'signIn', 'Please sign in to use the transcription service.');
+    if (!(await rpc('transcriber_user_allowed', { p_user_id: user.id }))) {
+      return refuse(req, 403, 'notAllowed', 'This app isn\u2019t open to new users yet.');
+    }
+    return await work(await readJson(req), user);
   } catch (err) {
     console.error(err && err.stack || err);
     if (err instanceof ServiceError && (err.code === 'speechmatics' || err.code === 'notSetUp')) return speechmaticsFailed(req, err);
@@ -276,9 +313,12 @@ async function handle(req, work) {
   }
 }
 
-async function findJob(jobId) {
+/** A job this person started (or one from before sign-in existed), or null. */
+async function findJob(jobId, user) {
   if (typeof jobId !== 'string' || !JOB_ID.test(jobId)) return null;
-  return rpc('transcriber_find_job', { p_speechmatics_id: jobId });
+  const row = await rpc('transcriber_find_job', { p_speechmatics_id: jobId });
+  if (!row || (row.user_id && row.user_id !== user.id)) return null;
+  return row;
 }
 
 /** check-limit: is there time left today? (The app asks before it uploads.) */
@@ -294,12 +334,12 @@ export function checkLimit(req) {
   });
 }
 
-/** start-job: send an uploaded file to Speechmatics. Body: { path, seconds } */
+/** start-job: send one of your uploaded recordings to Speechmatics. Body: { path, seconds } */
 export function startJob(req) {
-  return handle(req, async (body) => {
+  return handle(req, async (body, user) => {
     const path = body.path;
-    if (typeof path !== 'string' || !UPLOAD_PATH.test(path)) {
-      return refuse(req, 400, 'badRequest', 'That is not an upload from this app.');
+    if (!ownUpload(path, user)) {
+      return refuse(req, 400, 'badRequest', 'That is not one of your uploads from this app.');
     }
     let claimed = Math.round(Number(body.seconds));
     if (!isFinite(claimed) || claimed < 0) claimed = 0;
@@ -319,7 +359,8 @@ export function startJob(req) {
     const url = await signedUrl(path);
     const measured = await oggSeconds(url);
     await refreshLengths();
-    const begun = await rpc('transcriber_begin_job', {
+    const begun = await rpc('transcriber_begin_user_job', {
+      p_user_id: user.id,
       p_object_path: path,
       p_seconds: Math.max(claimed, measured || 0),
       p_limit_seconds: DAILY_LIMIT_MINUTES * 60,
@@ -368,8 +409,8 @@ export function startJob(req) {
 
 /** job-status: how is the job doing? Body: { jobId } -> { status: 'running' | 'done' | 'failed' } */
 export function jobStatus(req) {
-  return handle(req, async (body) => {
-    const row = await findJob(body.jobId);
+  return handle(req, async (body, user) => {
+    const row = await findJob(body.jobId, user);
     if (!row) return refuse(req, 404, 'unknownJob', 'This app has no job with that number.');
     const answer = await speechmatics(`/jobs/${encodeURIComponent(body.jobId)}`, { method: 'GET' });
     const job = (answer && answer.job) || {};
@@ -390,8 +431,8 @@ export function jobStatus(req) {
 
 /** job-result: the finished transcript in Speechmatics' json-v2 format. Body: { jobId } */
 export function jobResult(req) {
-  return handle(req, async (body) => {
-    const row = await findJob(body.jobId);
+  return handle(req, async (body, user) => {
+    const row = await findJob(body.jobId, user);
     if (!row) return refuse(req, 404, 'unknownJob', 'This app has no job with that number.');
     let result;
     try {
@@ -411,11 +452,18 @@ export function jobResult(req) {
   });
 }
 
-/** delete-audio: the app has saved the transcript, so delete the uploaded recording. Body: { jobId } */
+/**
+ * delete-audio: delete the uploaded recording of a job that did not become a saved
+ * transcript. Body: { jobId }. A recording kept by a transcript in My Transcripts is left
+ * alone: it stays until its owner deletes that transcript.
+ */
 export function deleteAudio(req) {
-  return handle(req, async (body) => {
-    const row = await findJob(body.jobId);
+  return handle(req, async (body, user) => {
+    const row = await findJob(body.jobId, user);
     if (!row) return refuse(req, 404, 'unknownJob', 'This app has no job with that number.');
+    if (await rpc('transcriber_audio_kept', { p_object_path: row.object_path })) {
+      return reply(req, 200, { deleted: false, kept: true });
+    }
     if (!row.audio_deleted) await removeFiles([row.object_path]);
     await rpc('transcriber_job_update', {
       p_speechmatics_id: body.jobId,
