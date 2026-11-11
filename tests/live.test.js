@@ -91,15 +91,13 @@ async function startListening(page) {
   const browser = await chromium.launch();
 
   try {
-    await test('opens on the Live tab with the three languages', browser, async (page) => {
+    await test('opens on the Live tab, English only: no language picker', browser, async (page) => {
       assert.strictEqual(await page.title(), 'Transcriber');
       assert.strictEqual(await text(page, '.app-title'), 'Transcriber');
       assert.ok(await page.isVisible('#panel-live'));
       assert.ok(!(await page.isVisible('#panel-file')));
-      const options = await page.$$eval('#live-language option', (o) => o.map((x) => [x.value, x.textContent]));
-      assert.deepStrictEqual(options, [
-        ['en-US', 'English (US)'], ['en-PH', 'English (Philippines)'], ['fil-PH', 'Filipino']
-      ]);
+      assert.strictEqual(await page.locator('#live-language, select').count(), 0);
+      assert.ok(!/Filipino|Language/.test(await text(page, '#panel-live')));
       assert.strictEqual(await text(page, '#live-toggle-label'), 'Start Listening');
     });
 
@@ -108,7 +106,7 @@ async function startListening(page) {
       assert.ok(await page.isVisible('#panel-file'));
       assert.ok(!(await page.isVisible('#panel-live')));
       assert.strictEqual(await text(page, '#file-choose'), 'Choose Audio or Video File');
-      assert.ok(await page.isVisible('#file-transcript'));
+      assert.ok(await page.isVisible('#file-output'));
       assert.ok(!(await page.isVisible('#transcript')));
       assert.strictEqual(await text(page, '#output-heading'), 'File Transcript');
       await page.click('#tab-live');
@@ -130,22 +128,21 @@ async function startListening(page) {
       }
     });
 
-    await test('Start uses the chosen language and shows listening', browser, async (page) => {
-      await page.selectOption('#live-language', 'fil-PH');
+    await test('Start listens in English and shows listening', browser, async (page) => {
       await startListening(page);
-      assert.strictEqual(await page.evaluate(() => window.__current().lang), 'fil-PH');
+      assert.strictEqual(await page.evaluate(() => window.__current().lang), 'en-US');
       assert.strictEqual(await page.evaluate(() => window.__current().continuous), true);
       assert.strictEqual(await page.evaluate(() => window.__current().interimResults), true);
       assert.strictEqual(await text(page, '#live-toggle-label'), 'Stop Listening');
       assert.strictEqual(await page.getAttribute('#live-toggle', 'aria-pressed'), 'true');
-      assert.ok(await page.isDisabled('#live-language'));
       assert.match(await text(page, '#live-status'), /Listening/);
     });
 
-    await test('language choice is remembered after reload', browser, async (page) => {
-      await page.selectOption('#live-language', 'en-PH');
+    await test('a language saved by the earlier version (Filipino) is ignored: always English', browser, async (page) => {
+      await page.evaluate(() => localStorage.setItem('transcriber.liveLanguage', 'fil-PH'));
       await page.reload();
-      assert.strictEqual(await page.inputValue('#live-language'), 'en-PH');
+      await startListening(page);
+      assert.strictEqual(await page.evaluate(() => window.__current().lang), 'en-US');
     });
 
     await test('interim words show in grey, then move to the transcript when final', browser, async (page) => {
@@ -166,12 +163,12 @@ async function startListening(page) {
 
     await test('repeated final results (Android quirk) are not duplicated', browser, async (page) => {
       await startListening(page);
-      await page.evaluate(() => window.__emit([['magandang umaga', true]]));
+      await page.evaluate(() => window.__emit([['good morning', true]]));
       // Same index delivered again
-      await page.evaluate(() => window.__emit([['magandang umaga', true]], 0));
+      await page.evaluate(() => window.__emit([['good morning', true]], 0));
       // Next result repeats the previous one plus new words
-      await page.evaluate(() => window.__emit([['magandang umaga', true], ['magandang umaga po sa inyo', true]], 1));
-      assert.strictEqual(await value(page), 'magandang umaga po sa inyo');
+      await page.evaluate(() => window.__emit([['good morning', true], ['good morning to you all', true]], 1));
+      assert.strictEqual(await value(page), 'good morning to you all');
     });
 
     await test('auto-restarts after Chrome stops on a pause, keeping the text', browser, async (page) => {
@@ -204,7 +201,6 @@ async function startListening(page) {
       await page.waitForTimeout(600);
       assert.strictEqual(await recCount(page), 1);
       assert.strictEqual(await text(page, '#live-toggle-label'), 'Start Listening');
-      assert.ok(!(await page.isDisabled('#live-language')));
       assert.strictEqual(await value(page), 'keep me');
       assert.match(await text(page, '#live-status'), /Stopped/);
     });

@@ -25,15 +25,6 @@
     <section class="panel" id="panel-live" role="tabpanel" aria-labelledby="tab-live">
       <h2 class="visually-hidden">Live Microphone</h2>
 
-      <div class="field">
-        <label for="live-language">Language</label>
-        <select id="live-language">
-          <option value="en-US">English (US)</option>
-          <option value="en-PH">English (Philippines)</option>
-          <option value="fil-PH">Filipino</option>
-        </select>
-      </div>
-
       <button id="live-toggle" class="big-button" type="button" aria-pressed="false">
         <span class="mic-dot" aria-hidden="true"></span>
         <span id="live-toggle-label">Start Listening</span>
@@ -55,33 +46,13 @@
       <div id="file-info" class="file-info" hidden>
         <p id="file-name" class="file-name"></p>
         <p id="file-details" class="muted"></p>
+        <audio id="file-player" class="player" controls preload="metadata" hidden></audio>
       </div>
 
-      <div class="field-row">
-        <div class="field">
-          <label for="file-language">Language</label>
-          <select id="file-language">
-            <option value="auto">Auto-Detect</option>
-            <option value="english">English</option>
-            <option value="tagalog">Filipino</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="file-speed">Speed</label>
-          <select id="file-speed" aria-describedby="speed-hint">
-            <option value="fast">Fast</option>
-            <option value="accurate">Accurate</option>
-          </select>
-        </div>
-      </div>
-      <p id="speed-hint" class="hint"></p>
-
-      <label class="check">
-        <input type="checkbox" id="file-timestamps">
-        <span>Show Timestamps</span>
-      </label>
-
-      <p id="model-note" class="note"></p>
+      <p id="service-note" class="note">
+        Recordings are transcribed by Speechmatics for the best accuracy, in English.
+        The sound is uploaded in a small compressed form and deleted once your transcript is saved.
+      </p>
 
       <div id="file-replace" class="confirm" hidden>
         <p id="file-replace-text"></p>
@@ -118,9 +89,28 @@
       <textarea id="transcript" class="transcript" rows="10"
         placeholder="Your words will appear here." spellcheck="true"
         aria-labelledby="output-heading" aria-describedby="interim-label"></textarea>
-      <textarea id="file-transcript" class="transcript" rows="10" hidden
-        placeholder="The transcript of your file will appear here." spellcheck="true"
-        aria-labelledby="output-heading"></textarea>
+      <div id="file-output" class="file-output" hidden>
+        <div class="file-tools">
+          <label class="switch">
+            <input type="checkbox" id="file-timestamps" role="switch" checked>
+            <span class="switch-track" aria-hidden="true"></span>
+            <span>Show Timestamps</span>
+          </label>
+          <div id="speaker-list" class="speaker-list" hidden></div>
+        </div>
+        <div id="rename-box" class="confirm" hidden>
+          <label id="rename-label" for="rename-input">New Name</label>
+          <input id="rename-input" class="text-input" type="text" maxlength="40" autocomplete="off">
+          <p class="hint">Every turn by this speaker changes. Leave it empty to go back to the number.</p>
+          <div class="confirm-buttons">
+            <button id="rename-save" class="small-button" type="button">Save Name</button>
+            <button id="rename-cancel" class="small-button" type="button">Cancel</button>
+          </div>
+        </div>
+        <div id="file-transcript" class="transcript turns" role="region" aria-labelledby="output-heading" tabindex="0"
+          data-placeholder="The transcript of your file will appear here."></div>
+        <p class="hint" id="turn-hint" hidden>Tap a time to play the recording from that moment. Tap a speaker to rename them. Tap the words to correct them.</p>
+      </div>
       <div class="interim-box">
         <span id="interim-label" class="interim-label">Still Hearing</span>
         <p id="interim" class="interim" aria-live="off"></p>
@@ -145,9 +135,15 @@
 
   <script src="keep-awake.js"></script>
   <script src="audio-reader.js"></script>
-  <script src="job-store.js"></script>
+  <script src="transcript-format.js"></script>
+  <script src="compact-audio.js"></script>
+  <script src="tus-upload.js"></script>
+  <script src="cloud-store.js"></script>
+  <script src="cloud-config.js"></script>
+  <script src="cloud-api.js"></script>
   <script src="live.js"></script>
   <script src="file.js"></script>
   <script src="app.js"></script>
+  <!-- Not loaded: whisper-file.js, whisper-worker.js and job-store.js (the hidden on-device Whisper option). -->
 </body>
 </html>

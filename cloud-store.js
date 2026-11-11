@@ -156,6 +156,7 @@
     putAudio: putAudio,
     getAudio: getAudio,
     deleteAudio: deleteAudio,
+    allJobs: allJobs,
     latestUnfinished: latestUnfinished,
     prune: prune
   };

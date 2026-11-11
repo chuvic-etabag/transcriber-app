@@ -44,7 +44,7 @@
       'Lost connection to the speech service. Check your internet and tap Start Listening again.',
     networkRetry: 'Connection hiccup. Trying again…',
     language:
-      'This language is not available on this phone’s speech service. Try another language.',
+      'English speech recognition is not available on this phone’s speech service. Update the Google app (and Speech Services by Google) and try again.',
     tooManyRestarts:
       'Chrome keeps stopping the microphone. Tap Start Listening to try again.',
     listening: 'Listening. Speak now.',

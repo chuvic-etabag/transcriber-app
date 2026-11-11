@@ -1,81 +1,86 @@
 /*
- * file.js — The File tab: choose an audio or video file and transcribe it
- * with Whisper, running in whisper-worker.js so the screen never freezes.
+ * file.js — The File tab: choose an audio or video file and get a transcript
+ * from Speechmatics, as numbered speaker turns (transcript-format.js).
  *
- * - Reads the file a section at a time (audio-reader.js), so 2 to 3 hour
- *   recordings work on a phone.
- * - Sends 30-second pieces to the worker and shows a percentage.
- * - Saves every finished piece in IndexedDB (job-store.js). Choosing the
- *   same file again carries on from the last saved piece.
- * - Keeps the screen on while it works (keep-awake.js).
+ * The steps, each saved in the browser (cloud-store.js) so a closed app, an
+ * internet cut or a phone restart carries on instead of starting over, and a
+ * file is never paid for twice:
+ *   1. Prepare: the sound becomes a small mono Ogg Opus file in the browser
+ *      (compact-audio.js), read a few minutes at a time (audio-reader.js).
+ *   2. Upload: to a private Supabase bucket in 6 MB pieces (tus-upload.js).
+ *   3. Speechmatics: an Edge Function starts the job (cloud-api.js); the app
+ *      checks on it until it is done. The Speechmatics job number is saved.
+ *   4. Save: the transcript is saved on this device, then the uploaded sound
+ *      is deleted from the server.
  *
- * Exposes window.FileTab. app.js creates it and gives it the page elements
- * and an `onText` callback (called whenever the transcript changes).
+ * Exposes window.FileTab. app.js creates it and gives it the page elements.
  */
 (function (global) {
   'use strict';
 
-  var MODELS = {
-    fast: { id: 'onnx-community/whisper-tiny', name: 'Fast', mb: 40 },
-    accurate: { id: 'onnx-community/whisper-base', name: 'Accurate', mb: 80 }
-  };
-  var ENGINE_MB = 27;   // the speech engine, downloaded once for both models
-  var ENGINE_FILE = 'ort-wasm-simd-threaded.asyncify.wasm';
-  var LONG_FILE_SECONDS = 30 * 60;
-  var STATE_KEY = 'transcriber.fileState';
-  var SETTINGS_KEY = 'transcriber.fileSettings';
+  var TF = global.TranscriptFormat;
+  var STATE_KEY = 'transcriber.cloudFileState';
+  var SETTINGS_KEY = 'transcriber.cloudFileSettings';
+  var OLD_STATE_KEY = 'transcriber.fileState';     // the Whisper transcript from TR Session B
+  var LONG_FILE_SECONDS = 60 * 60;
+  // How often to ask Speechmatics how it is going (the tests make these shorter).
+  var TIMING = { pollFirst: 4000, poll: 10000, pollSlow: 20000, retry: 8000, busy: 3000 };
+  var MB = 1000 * 1000;
 
   var MESSAGES = {
-    start: 'Choose a recording to get started. Your audio stays on this device.',
+    start: 'Choose a recording to get started.',
     reading: 'Reading the file…',
+    ready: 'Ready. Tap Start Transcribing.',
     unsupported:
       'This file type is not supported. Choose an audio file (MP3, M4A, WAV, OGG, WEBM, FLAC) or a video file (MP4, MOV, WEBM, MKV, 3GP).',
     unreadable:
       'This file could not be read. It may be damaged or only partly downloaded. Try opening it in another app to check it plays, or choose a different file.',
     noAudio: 'This file has no sound to transcribe.',
     fileRead:
-      'The file could not be read any more. It may have been moved, renamed or still be downloading. ' +
-      'Choose it again to carry on from where it stopped.',
-    tooLarge:
-      'This file is too large to read in this format. Save or convert it as MP3 or M4A and try again.',
-    memory:
-      'Your phone ran out of memory. Close other apps, then tap Continue Transcribing. Your progress is saved. If it keeps happening, choose Fast.',
-    offline: function (model, size) {
-      return 'No internet connection. The first time you use ' + model.name +
-        ', Transcriber needs to download the speech model (' + size + '). Connect to Wi-Fi and try again.';
+      'The file could not be read any more. It may have been moved, renamed or still be downloading. Choose it again to carry on.',
+    tooLarge: 'This file is too large to read in this format. Save or convert it as MP3 or M4A and try again.',
+    tooLong: 'This recording is too long to send in one go. Split it into parts of up to 12 hours and transcribe each part.',
+    memory: 'Your phone ran out of memory. Close other apps, then tap Continue Transcribing. Your progress is saved.',
+    oldBrowser: 'This browser cannot prepare recordings for upload. Update Chrome to the latest version and try again.',
+    space: 'There is not enough free space on this device to prepare the recording. Free up some space and try again.',
+    offline:
+      'No internet connection. Connect to the internet (Wi-Fi is best for long recordings), then tap Continue Transcribing. Nothing done so far is lost.',
+    offlineWaiting:
+      'No internet connection. Waiting for it to come back. The upload will carry on from where it stopped.',
+    offlineChecking:
+      'No internet connection. Speechmatics keeps working on your recording; the app will collect the transcript when you are back online.',
+    network:
+      'Could not reach the transcription service. Check your internet connection and tap Continue Transcribing to try again.',
+    uploadFailed:
+      'The upload failed. Check your internet connection and tap Continue Transcribing to try again. It carries on from where it stopped.',
+    uploadDenied:
+      'The upload was refused by the server. The storage for recordings may not be set up yet. Please try again later.',
+    speechmatics:
+      'Speechmatics could not transcribe this recording right now. Wait a few minutes, then tap Try Again.',
+    rejected: function (why) {
+      return 'Speechmatics could not transcribe this recording' + (why ? ' (it said: “' + why + '”)' : '') +
+        '. Tap Try Again. If it happens again, check that the recording plays and has speech in it.';
     },
-    downloadFailed: function (model, size) {
-      return 'The speech model (' + model.name + ', ' + size + ') could not be downloaded. ' +
-        'Check your internet connection (Wi-Fi is best) and tap Start Transcribing again.';
+    dailyLimit: function (minutes) {
+      return 'Today’s transcription time is used up. This app can send ' + (minutes || 60) +
+        ' minutes of recordings a day to Speechmatics (for everyone together), and that has been reached. Please try again tomorrow.';
     },
-    workerFailed: 'The speech model could not start. Reload the page and try again.',
-    storage: 'Progress could not be saved on this device, so if the app closes you will have to start again.',
-    ready: 'Ready. Tap Start Transcribing.',
-    loading: 'Getting the speech model ready…',
-    cancelled: function (at, total) {
-      return 'Stopped at ' + at + ' of ' + total + '. What is done so far is saved. ' +
-        'Tap Continue Transcribing to carry on, now or later.';
+    notSetUp: 'The transcription service is not set up yet. Please try again later.',
+    server: 'Something went wrong on the transcription server. Wait a minute, then tap Continue Transcribing.',
+    storage: 'Progress could not be saved on this device, so if the app closes it may have to start again.',
+    needFile: function (name) {
+      return 'To carry on, choose “' + name + '” again with Choose Audio or Video File.';
     },
-    done: function (length, took) {
-      return 'Done. Transcribed ' + length + ' of audio in ' + took + '.';
+    interrupted: function (name) {
+      return 'Transcribing “' + name + '” stopped when the app closed. Choose the same file again to carry on from where it stopped.';
     },
-    skipped: ' Some damaged parts of the file could not be read and were skipped.',
-    interrupted: function (name, at, total) {
-      return 'Transcribing “' + name + '” stopped at ' + at + ' of ' + total +
-        ' when the app closed. Choose the same file again to carry on from there.';
-    }
+    playNeedsFile: function (name) {
+      return 'To play the recording from this moment, choose “' + name + '” again with Choose Audio or Video File.';
+    },
+    cantPlay: 'This recording cannot be played here, but its transcript is fine.'
   };
 
   // ---------- Helpers ----------
-
-  function pad2(n) { return (n < 10 ? '0' : '') + n; }
-
-  /** 75 -> "1:15", 3725 -> "1:02:05" (hours shown when the file is an hour or longer). */
-  function clock(seconds, withHours) {
-    seconds = Math.max(0, Math.floor(seconds));
-    var h = Math.floor(seconds / 3600), m = Math.floor(seconds / 60) % 60, s = seconds % 60;
-    return withHours || h ? h + ':' + pad2(m) + ':' + pad2(s) : m + ':' + pad2(s);
-  }
 
   /** 41 -> "41 seconds", 3725 -> "1 hour 2 minutes". */
   function spoken(seconds) {
@@ -90,32 +95,33 @@
   }
 
   function loadJSON(key) {
-    try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { return null; }
+    try { return JSON.parse(global.localStorage.getItem(key) || 'null'); } catch (e) { return null; }
   }
   function saveJSON(key, value) {
-    try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { return false; }
+    try { global.localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { return false; }
   }
 
-  /** What is already saved on this device: { model: bool, engine: bool, mb: download still needed }. */
-  function isCached(model) {
-    var none = { model: false, engine: false };
-    var check = !global.caches ? Promise.resolve(none) :
-      global.caches.open('transformers-cache').then(function (cache) {
-        return cache.keys();
-      }).then(function (keys) {
-        return {
-          model: keys.some(function (r) {
-            return r.url.indexOf('/' + model.id + '/') !== -1 && r.url.indexOf('decoder_model_merged') !== -1;
-          }),
-          engine: keys.some(function (r) { return r.url.indexOf(ENGINE_FILE) !== -1; })
-        };
-      }).catch(function () { return none; });
-    return check.then(function (c) {
-      c.mb = (c.model ? 0 : model.mb) + (c.engine ? 0 : ENGINE_MB);
-      c.ready = c.mb === 0;
-      c.size = 'about ' + Math.ceil(c.mb / 5) * 5 + ' MB';
-      return c;
-    });
+  function uuid() {
+    if (global.crypto && global.crypto.randomUUID) return global.crypto.randomUUID();
+    var b = new Uint8Array(16);
+    global.crypto.getRandomValues(b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    var h = Array.prototype.map.call(b, function (x) { return ('0' + x.toString(16)).slice(-2); }).join('');
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+  }
+
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function TabError(code, extra) {
+    var e = new Error(code);
+    e.code = code;
+    if (extra) Object.keys(extra).forEach(function (k) { e[k] = extra[k]; });
+    return e;
+  }
+
+  function isQuotaError(err) {
+    return err && (err.name === 'QuotaExceededError' || /quota/i.test(String(err.message || '')));
   }
 
   // ---------- The tab ----------
@@ -127,22 +133,20 @@
     this.file = null;
     this.reader = null;
     this.key = null;
-    this.job = null;
-    this.pieces = [];         // finished pieces shown in the transcript: { start, end, text }
-    this.edited = false;      // the person has typed in the transcript box
+    this.job = null;              // the saved record for the current file (see cloud-store.js)
     this.running = false;
     this.cancelled = false;
-    this.worker = null;
-    this.workerModel = null;
-    this.pending = null;      // the worker request we are waiting for
+    this.upload = null;
+    this.playerUrl = null;
+    this.legacyText = '';         // a Whisper transcript from before TR Session C
     this.awake = global.KeepAwake ? new global.KeepAwake() : null;
+    this._run = 0;                // each run gets a number; an old run stops when it sees a newer one
     this._bind();
     this._restore();
   }
 
   FileTab.MESSAGES = MESSAGES;
-  FileTab.clock = clock;
-  FileTab.MODELS = MODELS;
+  FileTab.TIMING = TIMING;
 
   FileTab.prototype._bind = function () {
     var self = this, els = this.els;
@@ -167,35 +171,66 @@
     els.replaceNo.addEventListener('click', function () {
       els.replaceBox.hidden = true;
       self._waitingFile = null;
+      self.message(self.job && self.job.done ? 'Kept the transcript below.' : MESSAGES.start);
     });
-    els.speed.addEventListener('change', function () { self._saveSettings(); self._showModelNote(); });
-    els.language.addEventListener('change', function () { self._saveSettings(); });
-    els.timestamps.addEventListener('change', function () { self._saveSettings(); self._timestampsChanged(); });
-    els.transcript.addEventListener('input', function () {
-      self.edited = true;
-      self._saveState();
+    els.timestamps.addEventListener('change', function () {
+      self._saveSettings();
+      self._render();
     });
-    global.addEventListener('pagehide', function () { self._saveState(); });
+
+    // The transcript: tap a time to play, tap a speaker to rename, type to correct.
+    els.transcript.addEventListener('click', function (e) {
+      var time = e.target.closest('.turn-time');
+      if (time) { self.playFrom(Number(time.dataset.start), time.closest('.turn')); return; }
+      var speaker = e.target.closest('.turn-speaker');
+      if (speaker) self.askRename(speaker.dataset.speaker);
+    });
+    els.transcript.addEventListener('input', function (e) {
+      var text = e.target.closest('.turn-text');
+      if (text && self.job && self.job.turns) {
+        var turn = self.job.turns[Number(text.dataset.index)];
+        if (turn) turn.text = text.textContent.replace(/\s+/g, ' ').trim();
+        self._saveJobSoon();
+        self.onText();
+      } else if (e.target.classList.contains('legacy-text')) {
+        self.legacyText = e.target.innerText;
+        self._saveState();
+        self.onText();
+      }
+    });
+    els.transcript.addEventListener('keydown', function (e) {
+      // Enter would start a new line inside a turn; finish editing instead.
+      if (e.key === 'Enter' && e.target.closest('.turn-text')) { e.preventDefault(); e.target.blur(); }
+    });
+    els.speakerList.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-speaker]');
+      if (b) self.askRename(b.dataset.speaker);
+    });
+    els.renameSave.addEventListener('click', function () { self._saveRename(); });
+    els.renameCancel.addEventListener('click', function () { self._closeRename(); });
+    els.renameInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); self._saveRename(); }
+      if (e.key === 'Escape') { e.preventDefault(); self._closeRename(); }
+    });
+    els.player.addEventListener('error', function () {
+      if (self.els.player.getAttribute('src')) self.message(MESSAGES.cantPlay, 'warn');
+    });
+    global.addEventListener('pagehide', function () { self._saveState(); if (self._saveTimer) self._saveJobNow(); });
   };
 
   // ---------- Settings and saved state ----------
 
   FileTab.prototype._saveSettings = function () {
-    saveJSON(SETTINGS_KEY, {
-      speed: this.els.speed.value,
-      language: this.els.language.value,
-      timestamps: this.els.timestamps.checked
-    });
+    saveJSON(SETTINGS_KEY, { timestamps: this.els.timestamps.checked });
   };
 
+  /** What is on screen: which saved file it is (the transcript itself is in IndexedDB). */
   FileTab.prototype._saveState = function () {
     var ok = saveJSON(STATE_KEY, {
-      text: this.els.transcript.value,
-      pieces: this.pieces,
-      edited: this.edited,
-      key: this.key,
-      name: this.file ? this.file.name : (this._restoredName || ''),
-      duration: this.reader ? this.reader.duration : (this._restoredDuration || 0)
+      key: this.job ? this.key : null,
+      name: this.fileName(),
+      legacyText: this.legacyText || '',
+      oldChecked: Boolean(this._oldChecked)
     });
     if (!ok && !this._warnedStorage) {
       this._warnedStorage = true;
@@ -203,55 +238,107 @@
     }
   };
 
+  FileTab.prototype._saveJob = function (job) {
+    var self = this;
+    job = job || this.job;
+    if (!job) return Promise.resolve();
+    return global.CloudStore.putJob(job).catch(function (err) {
+      if (!self._warnedStorage) {
+        self._warnedStorage = true;
+        self.message(isQuotaError(err) ? MESSAGES.space : MESSAGES.storage, 'warn');
+      }
+    });
+  };
+
+  FileTab.prototype._saveJobSoon = function () {
+    var self = this;
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(function () { self._saveJobNow(); }, 400);
+  };
+  FileTab.prototype._saveJobNow = function () {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+    return this._saveJob();
+  };
+
   FileTab.prototype._restore = function () {
     var self = this;
     var settings = loadJSON(SETTINGS_KEY);
-    if (settings) {
-      if (settings.speed && MODELS[settings.speed]) this.els.speed.value = settings.speed;
-      if (settings.language) this.els.language.value = settings.language;
-      this.els.timestamps.checked = Boolean(settings.timestamps);
-    }
+    if (settings && typeof settings.timestamps === 'boolean') this.els.timestamps.checked = settings.timestamps;
     var state = loadJSON(STATE_KEY);
-    if (state && typeof state.text === 'string') {
-      this.els.transcript.value = state.text;
-      this.pieces = state.pieces || [];
-      this.edited = Boolean(state.edited);
-      this.key = state.key || null;
-      this._restoredName = state.name;
-      this._restoredDuration = state.duration;
-    }
     this.message(MESSAGES.start);
-    this._showModelNote();
-    this.onText();
-    // Tell the person if a transcription was cut short last time.
-    if (global.JobStore) {
-      global.JobStore.latestUnfinished().then(function (job) {
-        if (!job || self.file || !job.nextTime) return;
-        self.message(MESSAGES.interrupted(job.name, clock(job.nextTime, job.duration >= 3600),
-          clock(job.duration, job.duration >= 3600)), 'warn');
-      }).catch(function () {});
+    if (state) {
+      this.legacyText = state.legacyText || '';
+      this._restoredName = state.name || '';
     }
-  };
-
-  FileTab.prototype.model = function () {
-    return MODELS[this.els.speed.value] || MODELS.fast;
-  };
-
-  FileTab.prototype._showModelNote = function () {
-    var self = this;
-    var model = this.model();
-    this.els.speedHint.textContent = model === MODELS.fast
-      ? 'Fast is quicker. Accurate gets more words right, especially in Filipino, but takes about 3 times longer.'
-      : 'Accurate gets more words right, especially in Filipino, but takes about 3 times longer than Fast.';
-    isCached(model).then(function (cached) {
-      if (self.model() !== model) return;
-      self._download = cached;
-      self.els.modelNote.textContent = cached.ready
-        ? model.name + ' is downloaded and ready on this device.'
-        : 'First time only: ' + model.name + ' downloads the speech model (' + cached.size +
-          '). Please use Wi-Fi. After that it is saved on this device.';
-      self.els.modelNote.dataset.kind = cached.ready ? 'ready' : 'download';
+    if (!state || !state.oldChecked) {
+      // A transcript from the earlier on-device version (TR Session B): keep showing it, once.
+      var old = loadJSON(OLD_STATE_KEY);
+      if (old && typeof old.text === 'string' && old.text.trim() && !(state && state.key)) {
+        this.legacyText = old.text;
+        this._restoredName = old.name || '';
+      }
+      this._oldChecked = true;
+      this._saveState();
+    }
+    this._oldChecked = true;
+    this._render();
+    this.ready = Promise.resolve().then(function () {
+      if (!state || !state.key) return null;
+      return global.CloudStore.getJob(state.key).then(function (job) {
+        if (!job || self.file) return;
+        self.key = job.key;
+        self.job = job;
+        self._restoredName = job.name;
+        self._render();
+      });
+    }).catch(function () {}).then(function () {
+      return global.CloudStore.latestUnfinished();
+    }).then(function (job) {
+      if (!job || self.file || self.running) return;
+      if (job.stage === 'processing' && job.jobId) {
+        // Speechmatics already has it: collect the transcript, no file needed.
+        if (self.job && self.job.done && self.job.key !== job.key && self._hasText()) {
+          self.message(MESSAGES.interrupted(job.name), 'warn');
+          return;
+        }
+        self.key = job.key;
+        self.job = job;
+        self._restoredName = job.name;
+        self._showResume('Speechmatics is working on “' + job.name + '”. Its transcript will appear below when it is ready.', false);
+        self.start();
+        return;
+      }
+      self.message(MESSAGES.interrupted(job.name), 'warn');
+    }).catch(function () {}).then(function () {
+      self._retryDeletes();
     });
+  };
+
+  /** Uploaded sound whose delete didn't get through last time (no internet): try again. */
+  FileTab.prototype._retryDeletes = function () {
+    var self = this;
+    var store = global.CloudStore;
+    if (!store.allJobs) return;
+    store.allJobs().then(function (jobs) {
+      jobs.filter(function (j) { return j.done && j.jobId && !j.audioDeleted; }).forEach(function (j) {
+        self._deleteUploaded(j);
+      });
+    }).catch(function () {});
+  };
+
+  FileTab.prototype._deleteUploaded = function (job) {
+    var self = this;
+    this._deleting = this._deleting || {};
+    if (this._deleting[job.jobId]) return this._deleting[job.jobId];
+    var done = function () { delete self._deleting[job.jobId]; };
+    this._deleting[job.jobId] = global.CloudApi.deleteAudio(job.jobId).then(function () {
+      job.audioDeleted = true;
+      return global.CloudStore.getJob(job.key).then(function (saved) {
+        if (saved) { saved.audioDeleted = true; return global.CloudStore.putJob(saved); }
+      });
+    }).catch(function () { /* tried again next time the app opens */ }).then(done);
+    return this._deleting[job.jobId];
   };
 
   // ---------- Messages and progress ----------
@@ -261,12 +348,19 @@
     this.els.status.dataset.kind = kind || 'info';
   };
 
+  /** percent: a number, 'busy' (moving bar, no number) or null (hidden). */
   FileTab.prototype._progress = function (percent, label) {
-    this.els.progressBox.hidden = percent === null;
+    var els = this.els;
+    els.progressBox.hidden = percent === null;
     if (percent === null) return;
+    if (percent === 'busy') {
+      els.progress.removeAttribute('value');
+      els.percent.textContent = label || '';
+      return;
+    }
     var p = Math.max(0, Math.min(100, percent));
-    this.els.progress.value = p;
-    this.els.percent.textContent = label !== undefined ? label : Math.floor(p) + '%';
+    els.progress.value = p;
+    els.percent.textContent = label !== undefined ? label : Math.floor(p) + '%';
   };
 
   FileTab.prototype._setRunning = function (running) {
@@ -274,10 +368,8 @@
     this.running = running;
     document.body.dataset.fileState = running ? 'running' : 'idle';
     els.choose.disabled = running;
-    els.speed.disabled = running;
-    els.language.disabled = running;
     els.start.hidden = running;
-    els.cancel.hidden = !running;
+    els.cancel.hidden = !running || !this._cancellable;
     els.cancel.disabled = false;
     if (running) { if (this.awake) this.awake.start(); }
     else if (this.awake) this.awake.stop();
@@ -285,68 +377,226 @@
     this._updateStartButton();
   };
 
+  /** Cancel shows while preparing and uploading; once Speechmatics has it there is nothing to cancel. */
+  FileTab.prototype._setCancellable = function (yes) {
+    this._cancellable = yes;
+    this.els.cancel.hidden = !this.running || !yes;
+  };
+
   FileTab.prototype._updateStartButton = function () {
     var els = this.els;
-    var canStart = Boolean(this.reader) && !this.running && !this._choosing && !(this.job && this.job.done);
-    els.start.disabled = !canStart;
-    els.startLabel.textContent = this.job && this.job.nextTime > 0 && !this.job.done
-      ? 'Continue Transcribing' : 'Start Transcribing';
+    var job = this.job;
+    var hasSource = Boolean(this.reader) || Boolean(job && ['uploaded', 'processing'].indexOf(job.stage) !== -1) ||
+      Boolean(job && job.stage === 'uploading' && this._hasCompactAudio);
+    els.start.disabled = !hasSource || this.running || this._choosing || Boolean(job && job.done);
+    var label = 'Start Transcribing';
+    if (job && !job.done && job.failed) label = 'Try Again';
+    else if (job && !job.done && job.stage && job.stage !== 'new') label = 'Continue Transcribing';
+    els.startLabel.textContent = label;
   };
 
-  FileTab.prototype._showResume = function (text) {
+  /** The blue box under the status. canStartOver: show the Start Over button. */
+  FileTab.prototype._showResume = function (text, canStartOver) {
     this.els.resumeText.textContent = text || '';
     this.els.resumeBox.hidden = !text;
+    this.els.startOver.hidden = !canStartOver;
   };
 
-  // ---------- Transcript text ----------
+  // ---------- The transcript on screen ----------
 
-  FileTab.prototype._withHours = function () {
-    var d = this.reader ? this.reader.duration : (this._restoredDuration || 0);
-    return d >= 3600;
+  FileTab.prototype.fileName = function () {
+    if (this.file) return this.file.name;
+    if (this.job && this.job.name) return this.job.name;
+    return this._restoredName || '';
   };
 
-  FileTab.prototype._line = function (piece) {
-    if (!piece.text) return '';
-    return this.els.timestamps.checked ? '[' + clock(piece.start, this._withHours()) + '] ' + piece.text : piece.text;
+  FileTab.prototype._turns = function () {
+    return this.job && this.job.done && this.job.turns ? this.job.turns : null;
+  };
+
+  FileTab.prototype._hasText = function () {
+    return Boolean(this.text().trim());
+  };
+
+  /** The transcript as text, in the view that is showing (with or without times). */
+  FileTab.prototype.text = function () {
+    var turns = this._turns();
+    if (turns) return TF.formatTranscript(turns, this.job.speakers || [], this.job.names || {}, this.els.timestamps.checked);
+    return this.legacyText || '';
+  };
+
+  FileTab.prototype.wordCount = function () {
+    var turns = this._turns();
+    if (turns) return TF.countWords(turns);
+    var m = String(this.legacyText || '').replace(/\[\d{1,2}(?::\d{2}){1,2}\]/g, ' ').match(/[^\s]+/g);
+    return m ? m.length : 0;
   };
 
   FileTab.prototype._render = function () {
     var self = this;
-    this.els.transcript.value = this.pieces.map(function (p) { return self._line(p); })
-      .filter(Boolean).join('\n');
-    this.edited = false;
-    this._saveState();
+    var box = this.els.transcript;
+    var turns = this._turns();
+    var showTimes = this.els.timestamps.checked;
+    box.textContent = '';
+    this.els.speakerList.textContent = '';
+    this.els.speakerList.hidden = true;
+    this.els.turnHint.hidden = true;
+    if (turns) {
+      var speakers = this.job.speakers || [];
+      var names = this.job.names || {};
+      var frag = document.createDocumentFragment();
+      turns.forEach(function (t, i) {
+        var p = document.createElement('p');
+        p.className = 'turn' + (t.overlap ? ' is-overlap' : '');
+        p.dataset.n = t.n;
+        var n = document.createElement('span');
+        n.className = 'turn-n';
+        n.textContent = t.n + '. ';
+        p.appendChild(n);
+        if (showTimes) {
+          var time = document.createElement('button');
+          time.type = 'button';
+          time.className = 'turn-time';
+          time.dataset.start = t.start;
+          time.textContent = TF.range(t);
+          time.setAttribute('aria-label', 'Play from ' + TF.clock(t.start));
+          p.appendChild(time);
+          p.appendChild(document.createTextNode(' '));
+        }
+        var who = document.createElement('button');
+        who.type = 'button';
+        who.className = 'turn-speaker';
+        who.dataset.speaker = t.speaker;
+        who.textContent = TF.nameOf(t.speaker, speakers, names);
+        p.appendChild(who);
+        if (t.overlap) {
+          var o = document.createElement('span');
+          o.className = 'turn-overlap';
+          o.textContent = ' (overlap)';
+          p.appendChild(o);
+        }
+        p.appendChild(document.createTextNode(': '));
+        var text = document.createElement('span');
+        text.className = 'turn-text';
+        text.dataset.index = i;
+        text.contentEditable = 'plaintext-only';
+        if (text.contentEditable !== 'plaintext-only') text.contentEditable = 'true';
+        text.spellcheck = true;
+        text.textContent = t.text;
+        p.appendChild(text);
+        frag.appendChild(p);
+      });
+      box.appendChild(frag);
+      this._renderSpeakers();
+      this.els.turnHint.hidden = !turns.length;
+      if (!turns.length) box.textContent = '';
+    } else if (this.legacyText) {
+      var pre = document.createElement('p');
+      pre.className = 'legacy-text';
+      pre.contentEditable = 'plaintext-only';
+      if (pre.contentEditable !== 'plaintext-only') pre.contentEditable = 'true';
+      pre.textContent = this.legacyText;
+      box.appendChild(pre);
+    }
     this.onText();
+    void self;
   };
 
-  FileTab.prototype._append = function (piece) {
-    this.pieces.push({ start: piece.start, end: piece.end, text: piece.text });
-    var line = this._line(piece);
-    if (line) {
-      var box = this.els.transcript;
-      var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
-      var current = box.value;
-      box.value = current + (current && !/\n$/.test(current) ? '\n' : '') + line;
-      if (atBottom) box.scrollTop = box.scrollHeight;
-    }
-    this._saveState();
-    this.onText();
+  FileTab.prototype._renderSpeakers = function () {
+    var self = this;
+    var list = this.els.speakerList;
+    var speakers = (this.job && this.job.speakers) || [];
+    list.textContent = '';
+    speakers.forEach(function (s) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'small-button';
+      b.dataset.speaker = s;
+      b.textContent = 'Rename ' + TF.nameOf(s, speakers, self.job.names || {});
+      list.appendChild(b);
+    });
+    list.hidden = !speakers.length;
   };
 
-  FileTab.prototype._timestampsChanged = function () {
-    if (!this.pieces.length) return;
-    if (this.edited) {
-      this.message('You have edited the transcript, so timestamps change only for new sections. ' +
-        'Your edits are kept.', 'warn');
-      return;
-    }
+  // ---------- Renaming speakers ----------
+
+  FileTab.prototype.askRename = function (speaker) {
+    if (!this._turns()) return;
+    var speakers = this.job.speakers || [];
+    var current = TF.nameOf(speaker, speakers, this.job.names || {});
+    var number = TF.defaultNames(speakers)[speaker] || current;
+    this._renaming = speaker;
+    this.els.renameLabel.textContent = 'New Name for ' + number + (current !== number ? ' (Now “' + current + '”)' : '');
+    this.els.renameInput.value = current === number ? '' : current;
+    this.els.renameInput.placeholder = number;
+    this.els.renameBox.hidden = false;
+    this.els.renameInput.focus();
+  };
+
+  FileTab.prototype._closeRename = function () {
+    this.els.renameBox.hidden = true;
+    this._renaming = null;
+  };
+
+  /** Rename one speaker: every turn by them changes. An empty name goes back to "Speaker N". */
+  FileTab.prototype.rename = function (speaker, name) {
+    if (!this._turns()) return;
+    var clean = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    this.job.names = this.job.names || {};
+    if (clean) this.job.names[speaker] = clean;
+    else delete this.job.names[speaker];
+    this._saveJob();
     this._render();
   };
 
-  /** Called by app.js when the person clears the File transcript. */
+  FileTab.prototype._saveRename = function () {
+    if (!this._renaming) return;
+    var speaker = this._renaming;
+    var value = this.els.renameInput.value;
+    this._closeRename();
+    this.rename(speaker, value);
+    var label = TF.nameOf(speaker, this.job.speakers || [], this.job.names || {});
+    this.message('Renamed. Every turn by this speaker now says “' + label + '”.', 'done');
+  };
+
+  // ---------- Playing from a time ----------
+
+  FileTab.prototype.playFrom = function (seconds, turnEl) {
+    var player = this.els.player;
+    if (!this.file || !player.getAttribute('src')) {
+      this.message(MESSAGES.playNeedsFile(this.fileName() || 'the recording'), 'warn');
+      return;
+    }
+    var self = this;
+    player.hidden = false;
+    var go = function () {
+      try { player.currentTime = Math.max(0, seconds); } catch (e) { /* not ready yet */ }
+      var played = player.play();
+      if (played && played.catch) played.catch(function () { /* the person can press play */ });
+    };
+    if (player.readyState >= 1) go();
+    else player.addEventListener('loadedmetadata', go, { once: true });
+    var playing = this.els.transcript.querySelector('.turn.is-playing');
+    if (playing) playing.classList.remove('is-playing');
+    if (turnEl) turnEl.classList.add('is-playing');
+    void self;
+  };
+
+  FileTab.prototype._setPlayer = function (file) {
+    var player = this.els.player;
+    if (this.playerUrl) URL.revokeObjectURL(this.playerUrl);
+    this.playerUrl = file ? URL.createObjectURL(file) : null;
+    if (this.playerUrl) player.setAttribute('src', this.playerUrl);
+    else { player.removeAttribute('src'); player.hidden = true; }
+    player.hidden = !file;
+  };
+
+  /** Called by app.js when the person clears the File transcript. The saved job stays, so nothing is paid twice. */
   FileTab.prototype.cleared = function () {
-    this.pieces = [];
-    this.edited = false;
+    this.legacyText = '';
+    if (this.job && this.job.done) { this.job = null; this.key = null; }
+    this._closeRename();
+    this._render();
     this._saveState();
   };
 
@@ -359,14 +609,14 @@
     this.els.replaceBox.hidden = true;
 
     if (!global.AudioReader.looksSupported(file)) {
-      this._fail('unsupported');
+      this._fail(TabError('unsupported'));
       return Promise.resolve();
     }
 
     this.message(MESSAGES.reading);
     this._progress(null);
     this.els.choose.disabled = true;
-    this._choosing = true;            // Start and Start Over wait until the new file is open
+    this._choosing = true;
     this.els.startOver.disabled = true;
     this._updateStartButton();
     function finished() {
@@ -378,44 +628,50 @@
     var reader, key, asked = false;
     return global.AudioReader.open(file).then(function (r) {
       reader = r;
-      return global.JobStore.fileKey(file).catch(function () {
-        return 'n:' + file.name + ':' + file.size + ':' + file.lastModified;
-      });
+      return global.CloudStore.fileKey(file);
     }).then(function (k) {
       key = k;
-      // A different file would replace a transcript that's still in the box: ask first.
-      var hasOther = self.els.transcript.value.trim() && self.key && self.key !== key;
-      if (hasOther && !confirmed) {
+      // A different file would replace a transcript that's still on screen: ask first.
+      if (self._hasText() && self.key !== key && !confirmed) {
         asked = true;
         self._waitingFile = file;
-        self.els.replaceText.textContent = 'The transcript below is from “' +
-          (self.file ? self.file.name : self._restoredName || 'another file') +
-          '”. Choosing “' + file.name + '” will replace it. Copy or download it first if you need it.';
+        self.els.replaceText.textContent = 'The transcript below is from “' + (self.fileName() || 'another file') +
+          '”. Choosing “' + file.name + '” will replace it on the screen. Copy or download it first if you need it.';
         self.els.replaceBox.hidden = false;
         self.message('Choose what to do with the current transcript.');
         return null;
       }
-      return global.JobStore.getJob(key).catch(function () { return null; });
+      return global.CloudStore.getJob(key).catch(function () { return null; });
     }).then(function (job) {
       finished();
       if (asked || self.running) return;
       self.file = file;
       self.reader = reader;
-      var sameAsBox = self.key === key;
       self.key = key;
-      self.job = job || null;
+      self.legacyText = '';
+      self.job = job || { key: key, name: file.name, size: file.size, duration: reader.duration, stage: 'new', createdAt: Date.now() };
+      self.job.name = file.name;
+      self._setPlayer(file);
       self._showFileInfo();
-      if (job) return self._loadSaved(job, sameAsBox);
-      self.pieces = [];
-      self.els.transcript.value = '';
-      self.edited = false;
+      self._render();
       self._saveState();
-      self.onText();
+      if (job && job.done) {
+        self._showResume('This file was already transcribed. Its saved transcript is below, so it was not sent again.', false);
+        self.message('Already transcribed.', 'done');
+        self._progress(null);
+        self._updateStartButton();
+        return;
+      }
+      if (job && job.stage && job.stage !== 'new') {
+        self._showResume('Continuing where you left off with this file. Nothing done before is repeated or paid for again.',
+          job.stage === 'uploading');
+        return self.start();
+      }
       self._updateStartButton();
-      self._longFileWarning();
+      self._readyMessage();
     }).catch(function (err) {
       finished();
-      self._fail(err && err.code ? err.code : 'unreadable', err);
+      self._fail(err && err.code ? err : TabError('unreadable'), err);
     });
   };
 
@@ -426,316 +682,371 @@
     this.els.fileDetails.textContent = (r.duration ? spoken(r.duration) : 'Length unknown') + ' · ' + r.label;
   };
 
-  FileTab.prototype._longFileWarning = function () {
-    var d = this.reader.duration;
+  FileTab.prototype._readyMessage = function () {
+    var d = this.reader ? this.reader.duration : 0;
     if (d > LONG_FILE_SECONDS) {
-      this.message('This recording is ' + spoken(d) + ' long. On a phone this can take a long time, ' +
-        'often about as long as the recording itself on Accurate, or a third of that on Fast. ' +
-        'Keep the phone plugged in and this page open. If it stops, choose the same file again ' +
-        'to carry on from where it stopped.', 'warn');
+      this.message('Ready. This recording is ' + spoken(d) + ' long. Preparing and uploading it can take several minutes; ' +
+        'keep this page open until Speechmatics has it. If it stops, choose the same file again to carry on.', 'warn');
     } else {
       this.message(MESSAGES.ready);
     }
-  };
-
-  /** The file was worked on before: show what was saved and carry on. */
-  FileTab.prototype._loadSaved = function (job, sameAsBox) {
-    var self = this;
-    return global.JobStore.getPieces(job.key).then(function (pieces) {
-      var saved = pieces.map(function (p) { return { start: p.start, end: p.end, text: p.text }; });
-      if (sameAsBox && self.edited) {
-        // Keep the person's edits; add anything saved after the box was last stored.
-        if (self.pieces.length < saved.length) {
-          saved.slice(self.pieces.length).forEach(function (p) { self._append(p); });
-          self.pieces = saved;
-        }
-        self._saveState();
-      } else {
-        self.pieces = saved;
-        self._render();
-      }
-      var withHours = job.duration >= 3600;
-      self._updateStartButton();
-      if (job.done) {
-        self._showResume('This file was already transcribed. Its transcript is below. ' +
-          'Tap Start Over to transcribe it again.');
-        self.message('Already transcribed.');
-        self._progress(100);
-        return;
-      }
-      if (!job.nextTime) {
-        self._longFileWarning();
-        return;
-      }
-      var at = clock(job.nextTime, withHours), total = clock(job.duration, withHours);
-      self._showResume('Continuing where you left off. The first ' + at + ' of ' + total +
-        ' was already transcribed and saved, so Transcriber carries on from ' + at + '.');
-      return self.start();
-    });
-  };
-
-  // ---------- Worker ----------
-
-  FileTab.prototype._ensureWorker = function () {
-    var self = this;
-    if (this.worker) return this.worker;
-    var worker = new Worker('whisper-worker.js', { type: 'module' });
-    worker.onmessage = function (e) { self._onWorkerMessage(e.data); };
-    worker.onerror = function (e) {
-      if (e && e.preventDefault) e.preventDefault();
-      var text = String((e && e.message) || '');
-      self._workerFailed(global.AudioReader.isMemoryError({ message: text }) ? 'memory' : 'worker');
-    };
-    this.worker = worker;
-    this.workerModel = null;
-    return worker;
-  };
-
-  FileTab.prototype._workerFailed = function (code) {
-    if (this.worker) this.worker.terminate();
-    this.worker = null;
-    this.workerModel = null;
-    if (this.pending) {
-      var p = this.pending;
-      this.pending = null;
-      var err = new Error(code);
-      err.code = code;
-      p.reject(err);
-    }
-  };
-
-  FileTab.prototype._onWorkerMessage = function (msg) {
-    var p = this.pending;
-    if (msg.type === 'download') {
-      var mb = function (n) { return Math.round(n / 1048576); };
-      this.message('Downloading the speech model (first time only)… ' + mb(msg.loaded) + ' of ' +
-        mb(msg.total) + ' MB. Please stay on Wi-Fi.');
-      this._progress(msg.progress);
-      return;
-    }
-    if (!p) return;
-    if (msg.type === 'ready' && p.type === 'load') { this.pending = null; p.resolve(msg); }
-    else if (msg.type === 'result' && p.id === msg.id) { this.pending = null; p.resolve(msg); }
-    else if (msg.type === 'cancelled' && p.id === msg.id) { this.pending = null; p.resolve(msg); }
-    else if (msg.type === 'error') {
-      this.pending = null;
-      var err = new Error(msg.message);
-      err.code = msg.code;
-      p.reject(err);
-    }
-  };
-
-  FileTab.prototype._ask = function (message, transfer) {
-    var self = this;
-    return new Promise(function (resolve, reject) {
-      self.pending = { type: message.type, id: message.id, resolve: resolve, reject: reject };
-      self._ensureWorker().postMessage(message, transfer || []);
-    });
-  };
-
-  FileTab.prototype._loadModel = function (model) {
-    var self = this;
-    if (this.worker && this.workerModel === model.id) return Promise.resolve();
-    this.message(MESSAGES.loading);
-    this._progress(0, '');
-    return this._ask({ type: 'load', model: model.id, bytes: model.mb * 1048576 }).then(function () {
-      self.workerModel = model.id;
-      self._showModelNote();
-    });
   };
 
   // ---------- Transcribing ----------
 
   FileTab.prototype.start = function () {
     var self = this;
-    if (this.running || this._choosing || !this.reader) return Promise.resolve();
-    var model = this.model();
-    var language = this.els.language.value;
-    var reader = this.reader;
-    var withHours = reader.duration >= 3600;
+    if (this.running || this._choosing || !this.job || this.job.done) return Promise.resolve();
+    var job = this.job;
+    var run = ++this._run;
     this.cancelled = false;
+    job.failed = false;
+    this._setCancellable(job.stage === 'new' || job.stage === 'uploading');
     this._setRunning(true);
+    var stillMine = function () { return self._run === run && !self.cancelled; };
 
-    var startedAt = Date.now();
-    var audioDone = 0;           // seconds of audio transcribed this run (for the time estimate)
-    var job;
-
-    var run = isCached(model).then(function (cached) {
-      self._download = cached;
-      if (self.cancelled) return;
-      if (!cached.ready && global.navigator.onLine === false) {
-        var e = new Error('offline'); e.code = 'offline'; throw e;
-      }
-      return self._loadModel(model);
-    }).then(function () {
-      if (self.cancelled) return null;
-      job = self.job || {
-        key: self.key, name: self.file.name, size: self.file.size,
-        duration: reader.duration, kind: reader.kind,
-        nextTime: 0, cursor: reader.firstCursor, done: false, createdAt: Date.now()
-      };
-      job.model = model.id;
-      job.language = language;
-      self.job = job;
-      if (!job.nextTime) self.pieces = [];
-      return global.JobStore.putJob(job).catch(function () { self.message(MESSAGES.storage, 'warn'); });
-    }).then(function () {
-      if (self.cancelled || !job) return null;
-      startedAt = Date.now();
-      var chunker = new global.AudioReader.Chunker(reader, { startTime: job.nextTime, startCursor: job.cursor });
-      self._chunker = chunker;
-      self._showProgress(job.nextTime, reader.duration, withHours, null);
-      var next = chunker.next();
-      var id = 0;
-
-      function loop() {
-        return next.then(function (chunk) {
-          if (!chunk || self.cancelled) return chunk;
-          // Start reading the next piece while Whisper works on this one.
-          next = chunker.next();
-          next.catch(function () {});
-          var silent = global.AudioReader.isSilent(chunk.audio);
-          var ask = silent ? Promise.resolve({ type: 'result', text: '', language: null })
-            : self._ask({ type: 'transcribe', id: ++id, audio: chunk.audio, language: language }, [chunk.audio.buffer]);
-          return ask.then(function (result) {
-            if (result.type === 'cancelled' || self.cancelled) return null;
-            var piece = { key: job.key, start: chunk.start, end: chunk.end, text: result.text || '', language: result.language };
-            job.nextTime = chunk.end;
-            job.cursor = chunk.resume ? chunk.resume.cursor : null;
-            job.done = !chunk.resume;
-            return global.JobStore.savePiece(job, piece).catch(function () {
-              if (!self._warnedSave) { self._warnedSave = true; self.message(MESSAGES.storage, 'warn'); }
-            }).then(function () {
-              self._append(piece);
-              audioDone += chunk.end - chunk.start;
-              var perSecond = (Date.now() - startedAt) / 1000 / Math.max(1, audioDone);
-              self._showProgress(chunk.end, reader.duration, withHours, perSecond);
-              if (job.done) return null;
-              return loop();
-            });
-          });
-        });
-      }
-      return loop().then(function () { return chunker; });
-    }).then(function (chunker) {
-      self._chunker = null;
+    var work = this._steps(job, stillMine).then(function () {
+      if (self._run !== run) return;
       self._setRunning(false);
-      if (self.cancelled || !job) {
-        self._stoppedMessage();
-        return;
-      }
-      if (!job.done) {
-        // The reader ran out before the end we expected: treat it as finished.
-        job.done = true;
-        global.JobStore.putJob(job).catch(function () {});
-      }
-      self._progress(100);
-      var took = (Date.now() - startedAt) / 1000;
-      var text = MESSAGES.done(spoken(reader.duration || job.nextTime), spoken(took));
-      if (chunker && chunker.skippedParts) text += MESSAGES.skipped;
-      if (!self.els.transcript.value.trim()) text += ' No speech was found in this file.';
-      self.message(text, 'done');
-      self._showResume('');
-      self._updateStartButton();
-      global.JobStore.prune().catch(function () {});
+      self._finished(job);
     }).catch(function (err) {
-      if (self._chunker) self._chunker.stop();
-      self._chunker = null;
+      if (self._run !== run) return;
+      if (self.upload) { self.upload.stop(); self.upload = null; }
       self._setRunning(false);
-      if (self.cancelled) { self._stoppedMessage(); return; }
-      self._fail(err && err.code, err);
+      if (self.cancelled || (err && err.code === 'stopped')) { self._stoppedMessage(); return; }
+      self._fail(err, err);
     });
-    this._run = run;
-    return run;
+    this._work = work;
+    return work;
   };
 
-  FileTab.prototype._showProgress = function (at, total, withHours, perSecond) {
-    var percent = total ? at / total * 100 : 0;
-    if (percent >= 100 && this.job && !this.job.done) percent = 99;
-    var text = 'Transcribing… ' + Math.floor(percent) + '% (' + clock(at, withHours) + ' of ' + clock(total, withHours) + ').';
-    if (perSecond && total > at) {
-      var left = (total - at) * perSecond;
-      text += ' About ' + (left < 60 ? 'a minute' : spoken(left)) + ' left.';
+  FileTab.prototype._steps = function (job, stillMine) {
+    var self = this;
+    function check() { if (!stillMine()) throw TabError('stopped'); }
+
+    var step = Promise.resolve();
+    if (job.stage === 'new' || job.stage === 'uploading') {
+      step = step.then(function () {
+        if (global.navigator.onLine === false) throw TabError('offline');
+        self.message('Checking with the transcription service…');
+        self._progress('busy');
+        // Don't prepare or upload anything if today's time is already used up.
+        return global.CloudApi.checkLimit();
+      }).then(check);
     }
-    text += ' Keep this page open.';
-    this.message(text);
-    this._progress(percent);
+    return step.then(function () {
+      if (job.stage === 'new') return self._prepare(job, stillMine);
+    }).then(function (blob) {
+      check();
+      if (job.stage === 'uploading') return self._upload(job, blob, stillMine);
+    }).then(function () {
+      check();
+      if (job.stage === 'uploaded') return self._startJob(job, stillMine);
+    }).then(function () {
+      check();
+      if (job.stage === 'processing') return self._waitForSpeechmatics(job, stillMine);
+    });
+  };
+
+  /** Step 1: make the small Ogg Opus file and keep it on this device. */
+  FileTab.prototype._prepare = function (job, stillMine) {
+    var self = this;
+    if (!this.reader) throw TabError('needFile');
+    this.message('Preparing the audio… 0%. Keep this page open.');
+    this._progress(0);
+    return global.CompactAudio.convert(this.reader, {
+      isStopped: function () { return !stillMine(); },
+      onProgress: function (fraction) {
+        if (!stillMine()) return;
+        var p = Math.floor(fraction * 100);
+        self.message('Preparing the audio… ' + p + '%. Keep this page open.');
+        self._progress(p);
+      }
+    }).then(function (out) {
+      if (!stillMine()) throw TabError('stopped');
+      return global.CloudStore.putAudio(job.key, out.blob).then(function () {
+        self._hasCompactAudio = true;
+      }, function (err) {
+        // Not saved: it can still be uploaded now, but would need preparing again after a restart.
+        if (isQuotaError(err)) self.message(MESSAGES.space, 'warn');
+      }).then(function () {
+        job.stage = 'uploading';
+        job.objectPath = 'uploads/' + uuid() + '.ogg';
+        job.uploadUrl = null;
+        job.uploadOffset = 0;
+        job.compactBytes = out.bytes;
+        job.duration = out.duration || job.duration;
+        return self._saveJob(job);
+      }).then(function () { return out.blob; });
+    });
+  };
+
+  /** Step 2: upload in 6 MB pieces, saving the place after each piece. */
+  FileTab.prototype._upload = function (job, blob, stillMine) {
+    var self = this;
+    var config = global.CLOUD_CONFIG;
+    var get = blob ? Promise.resolve(blob) : global.CloudStore.getAudio(job.key).catch(function () { return null; });
+    return get.then(function (audio) {
+      if (!stillMine()) throw TabError('stopped');
+      if (!audio) {
+        // The prepared sound was not kept (no space, or cleared): prepare it again from the file.
+        if (!self.reader) throw TabError('needFile');
+        job.stage = 'new';
+        return self._prepare(job, stillMine).then(function (b) { return self._upload(job, b, stillMine); });
+      }
+      var total = audio.size;
+      var mb = function (n) { return (n / MB).toFixed(n < 10 * MB ? 1 : 0); };
+      var show = function (sent) {
+        if (!stillMine() || self._waitingNet) return;
+        var p = total ? Math.floor(sent / total * 100) : 0;
+        self.message('Uploading… ' + p + '% (' + mb(sent) + ' of ' + mb(total) + ' MB). Keep this page open.');
+        self._progress(p);
+      };
+      show(job.uploadOffset || 0);
+      var up = new global.ResumableUpload(audio, {
+        endpoint: config.uploadEndpoint,
+        headers: { authorization: 'Bearer ' + config.publishableKey, apikey: config.publishableKey },
+        bucket: config.bucket,
+        objectName: job.objectPath,
+        contentType: 'audio/ogg',
+        url: job.uploadUrl,
+        onSaved: function (place) {
+          job.uploadUrl = place.url;
+          job.uploadOffset = place.offset;
+          self._saveJob(job);
+        },
+        onProgress: show,
+        onWaiting: function (reason) {
+          if (!stillMine()) return;
+          self._waitingNet = reason === 'offline';
+          if (reason === 'offline') self.message(MESSAGES.offlineWaiting, 'warn');
+          else show(job.uploadOffset || 0);
+        }
+      });
+      self.upload = up;
+      return up.start().then(function () {
+        self.upload = null;
+        self._waitingNet = false;
+        job.stage = 'uploaded';
+        return self._saveJob(job);
+      }, function (err) {
+        self.upload = null;
+        self._waitingNet = false;
+        if (err.code === 'stopped') throw err;
+        if (err.code === 'tooLarge') throw TabError('tooLong');
+        if (err.code === 'denied') throw TabError('uploadDenied');
+        throw TabError('uploadFailed', { detail: err.message });
+      });
+    });
+  };
+
+  /** Step 3: ask the Edge Function to start the Speechmatics job, and save the job number. */
+  FileTab.prototype._startJob = function (job, stillMine) {
+    var self = this;
+    this._setCancellable(false);
+    this.els.cancel.hidden = true;
+    this.message('Sending to Speechmatics…');
+    this._progress('busy');
+    var tries = 0;
+    function attempt() {
+      return global.CloudApi.startJob(job.objectPath, job.duration).catch(function (err) {
+        if (err.code === 'busy' && tries++ < 20 && stillMine()) return wait(TIMING.busy).then(attempt);
+        if (err.code === 'notUploaded') {
+          // The upload was cleared from the server (after a day): upload it again.
+          job.stage = 'uploading';
+          job.uploadUrl = null;
+          job.uploadOffset = 0;
+          job.objectPath = 'uploads/' + uuid() + '.ogg';
+          return self._saveJob(job).then(function () {
+            self._setCancellable(true);
+            return self._upload(job, null, stillMine);
+          }).then(function () { self._setCancellable(false); return attempt(); });
+        }
+        throw err;
+      });
+    }
+    return attempt().then(function (res) {
+      if (!res || !res.jobId) return;   // the upload was redone above and started then
+      job.jobId = res.jobId;
+      job.stage = 'processing';
+      job.sentAt = job.sentAt || Date.now();
+      return self._saveJob(job).then(function () {
+        // Speechmatics has the sound now; the copy on this device is no longer needed.
+        self._hasCompactAudio = false;
+        return global.CloudStore.deleteAudio(job.key).catch(function () {});
+      });
+    });
+  };
+
+  /** Step 4: check on the job until it is done, then fetch and save the transcript. */
+  FileTab.prototype._waitForSpeechmatics = function (job, stillMine) {
+    var self = this;
+    this._setCancellable(false);
+    this.els.cancel.hidden = true;
+    var started = Date.now();
+    var checks = 0;
+    // Nothing happens on this device now, so the screen may sleep.
+    if (this.awake) this.awake.stop();
+    function show() {
+      var since = Math.max(0, Math.round((Date.now() - (job.sentAt || started)) / 1000));
+      self.message('Speechmatics is transcribing… (' + (since < 60 ? 'just started' : spoken(since) + ' so far') + '). ' +
+        'This usually takes a few minutes; long recordings can take up to about half their length. ' +
+        'You can close the app: the transcript will be collected when you come back.');
+      self._progress('busy');
+    }
+    function poll() {
+      if (!stillMine()) throw TabError('stopped');
+      checks++;
+      return global.CloudApi.jobStatus(job.jobId).then(function (s) {
+        if (s.status === 'done') return true;
+        if (s.status === 'failed') {
+          throw TabError('rejected', { why: (s.errors && s.errors[0]) || '' });
+        }
+        show();
+        return false;
+      }, function (err) {
+        if (err.code === 'offline' || err.code === 'network' || err.code === 'server') {
+          self.message(err.code === 'offline' ? MESSAGES.offlineChecking : 'Lost touch with the transcription service. Trying again…', 'warn');
+          return false;
+        }
+        throw err;
+      }).then(function (done) {
+        if (done) return;
+        return wait(checks < 8 ? TIMING.pollFirst : checks < 40 ? TIMING.poll : TIMING.pollSlow).then(poll);
+      });
+    }
+    show();
+    return poll().then(function () {
+      self.message('Saving the transcript…');
+      return self._fetchResult(job, stillMine);
+    });
+  };
+
+  FileTab.prototype._fetchResult = function (job, stillMine) {
+    var self = this;
+    var tries = 0;
+    function attempt() {
+      return global.CloudApi.jobResult(job.jobId).catch(function (err) {
+        if (['offline', 'network', 'server', 'notReady'].indexOf(err.code) !== -1 && tries++ < 1000 && stillMine()) {
+          if (err.code === 'offline') self.message(MESSAGES.offlineChecking, 'warn');
+          return wait(err.code === 'notReady' ? TIMING.busy : TIMING.retry).then(attempt);
+        }
+        throw err;
+      });
+    }
+    return attempt().then(function (result) {
+      if (!stillMine()) throw TabError('stopped');
+      var built = TF.buildTurns(result);
+      job.turns = built.turns;
+      job.speakers = built.speakers;
+      job.names = job.names || {};
+      job.resultDuration = built.duration;
+      job.stage = 'done';
+      job.done = true;
+      job.doneAt = Date.now();
+      job.audioDeleted = false;
+      return global.CloudStore.putJob(job).then(function () {
+        // Saved on this device: now the uploaded sound can go.
+        self._deleteUploaded(job);
+        global.CloudStore.prune().catch(function () {});
+      }, function (err) {
+        // Not saved (no space): show it anyway, but keep the sound so it can be collected again.
+        self.message(isQuotaError(err) ? MESSAGES.space : MESSAGES.storage, 'warn');
+      });
+    });
+  };
+
+  FileTab.prototype._finished = function (job) {
+    if (this.job !== job) return;
+    this._progress(100);
+    this._showResume('');
+    this._render();
+    this._saveState();
+    var length = job.duration || job.resultDuration;
+    var text = 'Done. Transcribed ' + (length ? spoken(length) + ' of audio' : 'the recording') + '.';
+    if (!job.turns.length) text += ' No speech was found in this file.';
+    this.message(text, 'done');
+    this._updateStartButton();
   };
 
   FileTab.prototype._stoppedMessage = function () {
     var job = this.job;
-    var withHours = this.reader && this.reader.duration >= 3600;
     this._updateStartButton();
-    if (job && job.nextTime > 0) {
-      this.message(MESSAGES.cancelled(clock(job.nextTime, withHours), clock(job.duration, withHours)));
+    this._progress(null);
+    if (job && job.stage === 'uploading' && job.uploadOffset) {
+      this.message('Stopped. The upload so far is saved. Tap Continue Transcribing to carry on, now or later.');
+    } else if (job && job.stage !== 'new') {
+      this.message('Stopped. Tap Continue Transcribing to carry on, now or later.');
     } else {
       this.message('Stopped. Tap Start Transcribing to begin again.');
-      this._progress(null);
     }
   };
 
   FileTab.prototype.cancel = function () {
-    if (!this.running) return;
+    if (!this.running || !this._cancellable) return;
     this.cancelled = true;
     this.els.cancel.disabled = true;
     this.message('Stopping…');
-    if (this._chunker) this._chunker.stop();   // no more reading ahead
-    if (this.pending && this.pending.type === 'load') {
-      // Can't pause a download: stop the worker; nothing half-downloaded is kept.
-      this._workerFailed('cancelled');
-    } else if (this.worker) {
-      this.worker.postMessage({ type: 'cancel' });
-    }
+    if (this.upload) this.upload.stop();
   };
 
+  /** Throw away the saved progress for this file (before Speechmatics has it) and start again. */
   FileTab.prototype.startOver = function () {
     var self = this;
-    if (this._startingOver || this._choosing) return this._startingOver || Promise.resolve();
-    this.els.startOver.disabled = true;
-    var wait = Promise.resolve();
+    if (this._choosing || !this.job || (this.job.stage === 'processing')) return Promise.resolve();
+    var wait1 = Promise.resolve();
     if (this.running) {
       this.cancel();
-      wait = this._run || Promise.resolve();
+      wait1 = this._work || Promise.resolve();
     }
-    this._startingOver = wait.then(function () {
-      return self.key ? global.JobStore.deleteJob(self.key).catch(function () {}) : null;
+    this.els.startOver.disabled = true;
+    return wait1.then(function () {
+      return global.CloudStore.deleteJob(self.key).catch(function () {});
     }).then(function () {
-      self.job = null;
-      self.pieces = [];
-      self.els.transcript.value = '';
-      self.edited = false;
-      self._saveState();
-      self.onText();
-      self._showResume('');
-      self._progress(null);
-      self._startingOver = null;
       self.els.startOver.disabled = false;
+      self._showResume('');
+      self._hasCompactAudio = false;
+      self.job = { key: self.key, name: self.fileName(), size: self.file ? self.file.size : 0,
+        duration: self.reader ? self.reader.duration : 0, stage: 'new', createdAt: Date.now() };
       if (self.reader) return self.start();
       self.message(MESSAGES.start);
-    }, function () {
-      self._startingOver = null;
-      self.els.startOver.disabled = false;
     });
-    return this._startingOver;
   };
 
-  FileTab.prototype._fail = function (code, err) {
-    var model = this.model();
-    var size = this._download && this._download.mb ? this._download.size : 'about ' + model.mb + ' MB';
+  FileTab.prototype._fail = function (err, original) {
+    var code = err && err.code;
+    var job = this.job;
     var text;
-    if (code === 'offline' || (code === 'download' && global.navigator.onLine === false)) text = MESSAGES.offline(model, size);
-    else if (code === 'download') text = MESSAGES.downloadFailed(model, size);
-    else if (code === 'memory') text = MESSAGES.memory;
-    else if (code === 'worker' || code === 'other') text = MESSAGES.workerFailed;
-    else if (code === 'cancelled') { this._stoppedMessage(); return; }
-    else if (MESSAGES[code] && typeof MESSAGES[code] === 'string') text = MESSAGES[code];
-    else text = MESSAGES.unreadable;
-    // Start fresh next time: a worker that failed (or ran out of memory) keeps its bloated memory.
-    if (['download', 'offline', 'worker', 'other', 'memory'].indexOf(code) !== -1) this._workerFailed('reset');
-    this.message(text, 'error');
+    var kind = 'error';
+    switch (code) {
+      case 'offline': text = MESSAGES.offline; break;
+      case 'network': text = MESSAGES.network; break;
+      case 'uploadFailed': text = MESSAGES.uploadFailed; break;
+      case 'uploadDenied': text = MESSAGES.uploadDenied; break;
+      case 'dailyLimit': text = MESSAGES.dailyLimit(err.limitMinutes); break;
+      case 'speechmatics': text = MESSAGES.speechmatics; if (job) job.failed = true; break;
+      case 'rejected':
+        text = MESSAGES.rejected(err.why);
+        if (job) { job.failed = true; job.stage = 'uploaded'; job.jobId = null; this._saveJob(job); }
+        break;
+      case 'notSetUp': text = MESSAGES.notSetUp; break;
+      case 'server': case 'busy': case 'badRequest': case 'unknownJob': text = MESSAGES.server; break;
+      case 'needFile': text = MESSAGES.needFile(this.fileName()); kind = 'warn'; break;
+      case 'unsupported':
+        // From the converter: this browser has no Opus encoder. Otherwise: the file type.
+        text = err.message === 'No Opus encoder in this browser' ? MESSAGES.oldBrowser : MESSAGES.unsupported;
+        break;
+      case 'encoder': text = MESSAGES.oldBrowser; break;
+      case 'tooLong': text = MESSAGES.tooLong; break;
+      case 'memory': text = MESSAGES.memory; break;
+      default:
+        text = MESSAGES[code] && typeof MESSAGES[code] === 'string' ? MESSAGES[code] : MESSAGES.unreadable;
+    }
+    if (isQuotaError(original)) text = MESSAGES.space;
+    this.message(text, kind);
     this._progress(null);
     this._updateStartButton();
-    if (err && global.console) global.console.warn('Transcriber:', code, err);
+    if (original && global.console) global.console.warn('Transcriber:', code, original);
   };
 
   global.FileTab = FileTab;

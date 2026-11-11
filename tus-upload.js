@@ -49,6 +49,7 @@
   }
 
   ResumableUpload.CHUNK = CHUNK;
+  ResumableUpload.WAITS = WAITS;   // waits between tries (the tests make these shorter)
 
   ResumableUpload.prototype.stop = function () {
     this.stopped = true;
@@ -175,10 +176,12 @@
       else if (needHead) action = self._head().then(function () { needHead = false; });
       else if (self.offset >= self.blob.size) return Promise.resolve();
       else action = self._patch();
+      var asking = needHead;
       return action.then(function () {
         if (networkTries && self.opts.onWaiting) self.opts.onWaiting(null);
         networkTries = 0;
-        serverTries = 0;
+        // Only real progress (not just asking where we are) clears the count of server problems.
+        if (!asking) serverTries = 0;
         return step();
       }, function (err) {
         if (self.stopped || err.code === 'stopped') throw UploadError('stopped');
@@ -201,7 +204,7 @@
         if (err.code === 'network') {
           // No answer at all: usually the internet is down. Keep waiting until it comes back.
           if (self.opts.onWaiting) self.opts.onWaiting(global.navigator.onLine === false || networkTries >= 1 ? 'offline' : 'retrying');
-          var wait = WAITS[Math.min(networkTries, WAITS.length - 1)];
+          var wait = ResumableUpload.WAITS[Math.min(networkTries, ResumableUpload.WAITS.length - 1)];
           networkTries++;
           needHead = Boolean(self.url);
           return self._wait(wait).then(step);
@@ -210,7 +213,7 @@
           serverTries++;
           if (serverTries > SERVER_RETRIES) throw UploadError('failed', err.message, err.status);
           needHead = Boolean(self.url);
-          return self._wait(WAITS[Math.min(serverTries, WAITS.length - 1)]).then(step);
+          return self._wait(ResumableUpload.WAITS[Math.min(serverTries, ResumableUpload.WAITS.length - 1)]).then(step);
         }
         throw err;
       });

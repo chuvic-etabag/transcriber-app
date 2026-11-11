@@ -1,162 +1,194 @@
 /*
- * Browser tests for the File tab and the output tools, with the real Whisper
- * model running in the worker. Run from the repo root:
+ * Browser tests for the File tab with Speechmatics (file.js) and the output
+ * tools, in Chromium. Supabase (resumable uploads and the Edge Functions) is
+ * played by this test, and "Speechmatics" answers with made-up results in
+ * its exact json-v2 format (tests/fixtures/). Run from the repo root:
  *
- *   node tests/file.test.js            (add --long for the 2.5-hour files)
+ *   node tests/file.test.js
  *
- * Needs Python 3, ffmpeg, curl and Playwright. The first run downloads the
- * speech models (about 120 MB) and some speech recordings into a cache
- * folder; later runs use the cache. Requests to huggingface.co are answered
- * from that cache, which also lets the tests pretend the internet is down.
+ * Needs Python 3, ffmpeg, curl and Playwright with Chromium. The first run
+ * downloads a few short speech recordings into a cache folder.
  */
 'use strict';
 const { chromium, devices } = require('playwright');
-const { spawn, execFileSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const assert = require('assert');
 const media = require('./media');
+const F = require('../transcript-format.js');
+const B = require('./fixtures/speechmatics-builder.js');
 
 const ROOT = path.resolve(__dirname, '..');
-const PORT = 8766;
-const URL = `http://localhost:${PORT}/index.html`;
-const LONG = process.argv.includes('--long');
+const PORT = 8768;
+const ORIGIN = `http://localhost:${PORT}`;
+const URL = `${ORIGIN}/index.html`;
 const ONLY = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7);
-const HF_DIR = path.join(media.DIR, 'hf');
+const SUPABASE = 'https://mgiwopbaglgzxeaowzzt.supabase.co';
+const FIX = path.join(__dirname, 'fixtures', 'speechmatics');
+const saved = (name) => JSON.parse(fs.readFileSync(path.join(FIX, name + '.json'), 'utf8'));
 
 // ---------- Test media ----------
 
-function speechFiles() {
+function testFiles() {
   const jfk = media.speech('jfk.wav');
   const ted = media.speech('ted_60.wav');
-  const files = {
+  const f = {
     jfk,
     ted,
-    interview: media.speech('interview.mp4'),       // video: H.264 + AAC
-    hopper: media.speech('hopper.webm'),            // video: VP9 + Opus
-    courtroom: media.speech('courtroom.mp4'),
     mp3: media.make('jfk.mp3', jfk, ['-c:a', 'libmp3lame', '-b:a', '64k']),
-    m4a: media.make('jfk.m4a', jfk, ['-c:a', 'aac', '-b:a', '64k']),
-    ogg: media.make('jfk.ogg', jfk, ['-c:a', 'libopus', '-b:a', '32k']),
-    webm: media.make('jfk.webm', jfk, ['-c:a', 'libopus', '-b:a', '32k']),
-    flac: media.make('jfk.flac', jfk, ['-c:a', 'flac']),
-    aac: media.make('jfk.aac', jfk, ['-c:a', 'aac', '-b:a', '64k']),
-    mov: media.make('jfk.mov', jfk, [], ['-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=10:duration=11',
-      '-map', '1:v', '-map', '0:a', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest']),
+    courtroom: media.speech('courtroom.mp4'),
+    // 40 minutes of speech: its compact audio (about 7 MB) needs two 6 MB upload pieces.
+    long: path.join(media.DIR, 'speech-40min.mp3')
   };
-  // Filipino speech (Google FLEURS, Tagalog), six sentences.
-  files.fil = path.join(media.DIR, 'fil.wav');
-  if (!fs.existsSync(files.fil)) {
-    const dir = path.join(media.DIR, 'fleurs');
-    fs.mkdirSync(dir, { recursive: true });
-    execFileSync('bash', ['-c', `cd ${dir} && curl -sSfL -r 0-6000000 -o part.tgz ` +
-      '"https://huggingface.co/datasets/google/fleurs/resolve/main/data/fil_ph/audio/dev.tar.gz" ; ' +
-      'tar xzf part.tgz 2>/dev/null; ls dev/*.wav | head -6 | sed "s/^/file /" > list.txt']);
-    media.ff(['-f', 'concat', '-safe', '0', '-i', path.join(dir, 'list.txt'), '-ar', '16000', '-ac', '1', files.fil]);
+  if (!fs.existsSync(f.long)) {
+    media.ff(['-stream_loop', '-1', '-i', ted, '-t', '2400', '-ac', '1', '-c:a', 'libmp3lame', '-b:a', '32k', f.long]);
   }
-  // 40 minutes of speech (over the 30-minute warning), small MP3.
-  files.long40 = path.join(media.DIR, 'speech-40min.mp3');
-  if (!fs.existsSync(files.long40)) {
-    media.ff(['-stream_loop', '-1', '-i', ted, '-t', '2400', '-ac', '1', '-c:a', 'libmp3lame', '-b:a', '32k', files.long40]);
-  }
-  files.noSound = path.join(media.DIR, 'silent-video.mp4');
-  if (!fs.existsSync(files.noSound)) {
-    media.ff(['-f', 'lavfi', '-i', 'testsrc=size=160x120:rate=10:duration=3', '-c:v', 'libx264', '-preset', 'ultrafast', files.noSound]);
-  }
-  files.text = path.join(media.DIR, 'notes.txt');
-  fs.writeFileSync(files.text, 'These are notes, not a recording.\n');
-  files.broken = path.join(media.DIR, 'broken.mp3');
-  if (!fs.existsSync(files.broken)) {
-    const junk = Buffer.alloc(200000);
-    for (let i = 0; i < junk.length; i++) junk[i] = (i * 7919 + 13) % 251;
-    fs.writeFileSync(files.broken, junk);
-  }
-  return files;
+  f.text = path.join(media.DIR, 'notes.txt');
+  fs.writeFileSync(f.text, 'These are notes, not a recording.\n');
+  return f;
 }
 
-function longFiles() {
-  const secs = 2.5 * 3600;
-  const ted = media.speech('ted_60.wav');
-  const out = {};
-  const mk = (name, args, video) => {
-    const file = path.join(media.DIR, name);
-    if (!fs.existsSync(file)) {
-      const input = ['-stream_loop', '-1', '-i', ted];
-      const v = video ? ['-f', 'lavfi', '-i', `testsrc=size=160x120:rate=1:duration=${secs}`, '-map', '1:v', '-map', '0:a'] : [];
-      media.ff(input.concat(v, ['-t', String(secs)], args, [file]));
-    }
-    return file;
+// ---------- A pretend Supabase + Speechmatics ----------
+
+function freshServer() {
+  return {
+    uploads: new Map(),        // id -> { length, bytes: Buffer[], received, objectName, contentType }
+    objects: new Map(),        // objectName -> Buffer
+    calls: [],                 // { fn, body } for the Edge Functions
+    tus: [],                   // { method, id, offset, size }
+    jobs: new Map(),           // jobId -> { path, seconds, polls, status, why }
+    nextJob: 1,
+    // Knobs the tests turn:
+    result: saved('two-speakers'),
+    pollsUntilDone: 1,
+    limitReached: false,
+    limitAtStart: false,
+    startFails: 0,             // how many start-job calls answer "Speechmatics failed"
+    reject: null,              // a reason to reject the next job
+    notDeployed: false,
+    patchFails: 0,             // how many PATCH requests answer 500
+    holdPatch: null,           // a function that, when set, decides to hold a PATCH (returns a promise)
+    afterPatch: null
   };
-  out.mp3 = mk('speech-2h30.mp3', ['-ac', '1', '-c:a', 'libmp3lame', '-b:a', '32k']);
-  out.m4a = mk('speech-2h30.m4a', ['-ac', '1', '-c:a', 'aac', '-b:a', '48k']);
-  out.mp4 = mk('speech-2h30.mp4', ['-c:v', 'libx264', '-preset', 'ultrafast', '-g', '10', '-ac', '1', '-c:a', 'aac', '-b:a', '48k'], true);
-  out.webm = mk('speech-2h30.webm', ['-ac', '1', '-c:a', 'libopus', '-b:a', '24k']);
-  return out;
 }
 
-// ---------- Hugging Face, answered from a local cache ----------
+let server = freshServer();
+const fnCalls = (fn) => server.calls.filter((c) => c.fn === fn);
 
-const net = { mode: 'ok' };   // 'ok' | 'fail'
+const CORS = {
+  'access-control-allow-origin': ORIGIN,
+  'access-control-allow-headers': '*',
+  'access-control-allow-methods': 'GET, POST, PATCH, HEAD, DELETE, OPTIONS',
+  'access-control-expose-headers': 'Location, Upload-Offset, Upload-Length, Tus-Resumable'
+};
 
-function cachedModelFile(pathname) {
-  const local = path.join(HF_DIR, decodeURIComponent(pathname).replace(/\.\./g, ''));
-  if (fs.existsSync(local) || fs.existsSync(local + '.404')) return local;
-  fs.mkdirSync(path.dirname(local), { recursive: true });
-  try {
-    execFileSync('curl', ['-sSfL', '--retry', '3', '-o', local + '.part', 'https://huggingface.co' + pathname]);
-    fs.renameSync(local + '.part', local);
-  } catch (e) {
-    fs.rmSync(local + '.part', { force: true });
-    fs.writeFileSync(local + '.404', '');
-  }
-  return local;
-}
-
-async function routeModels(context) {
-  await context.route('https://huggingface.co/**', async (route) => {
-    if (net.mode === 'fail') return route.abort('internetdisconnected');
-    const url = new globalThis.URL(route.request().url());
-    const local = cachedModelFile(url.pathname);
-    const headers = {
-      'access-control-allow-origin': '*',
-      'access-control-expose-headers': 'content-length, content-range, etag',
-      'content-type': 'application/octet-stream',
-      'accept-ranges': 'bytes'
-    };
-    if (!fs.existsSync(local)) return route.fulfill({ status: 404, headers, body: 'Not found' });
-    const body = fs.readFileSync(local);
-    const range = /bytes=(\d+)-(\d*)/.exec(route.request().headers().range || '');
-    if (range) {
-      const start = Number(range[1]);
-      const end = range[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
-      return route.fulfill({
-        status: 206,
-        headers: { ...headers, 'content-range': `bytes ${start}-${end}/${body.length}` },
-        body: body.subarray(start, end + 1)
-      });
-    }
-    return route.fulfill({ status: 200, headers, body });
+async function fakeSupabase(route) {
+  const req = route.request();
+  const url = new globalThis.URL(req.url());
+  const method = req.method();
+  if (method === 'OPTIONS') return route.fulfill({ status: 200, headers: CORS, body: '' });
+  const h = req.headers();
+  const reply = (status, body, extra) => route.fulfill({
+    status, headers: { ...CORS, 'content-type': 'application/json', ...(extra || {}) }, body: body === undefined ? '' : JSON.stringify(body)
   });
+
+  // Every call carries the publishable key and nothing secret.
+  assert.strictEqual(h.apikey, 'sb_publishable_BZjwO2iS-yPbM-MBotusbQ_3lIVcMAS');
+
+  // --- Resumable uploads (tus) ---
+  if (url.pathname.startsWith('/storage/v1/upload/resumable')) {
+    const id = url.pathname.split('/')[5];
+    if (method === 'POST' && !id) {
+      const meta = Object.fromEntries(h['upload-metadata'].split(',').map((kv) => {
+        const [k, v] = kv.split(' ');
+        return [k, Buffer.from(v, 'base64').toString()];
+      }));
+      assert.strictEqual(meta.bucketName, 'recordings');
+      assert.match(meta.objectName, /^uploads\/[0-9a-f-]{36}\.ogg$/);
+      assert.strictEqual(meta.contentType, 'audio/ogg');
+      const newId = 'up' + (server.uploads.size + 1);
+      server.uploads.set(newId, { length: Number(h['upload-length']), bytes: [], received: 0, objectName: meta.objectName });
+      server.tus.push({ method, id: newId, size: Number(h['upload-length']) });
+      return reply(201, undefined, { location: `${SUPABASE}/storage/v1/upload/resumable/${newId}`, 'tus-resumable': '1.0.0' });
+    }
+    const up = server.uploads.get(id);
+    if (!up) return reply(404, { error: 'not found' });
+    if (method === 'HEAD') {
+      server.tus.push({ method, id, offset: up.received });
+      return route.fulfill({ status: 200, headers: { ...CORS, 'upload-offset': String(up.received), 'upload-length': String(up.length), 'tus-resumable': '1.0.0' } });
+    }
+    if (method === 'PATCH') {
+      const offset = Number(h['upload-offset']);
+      const body = req.postDataBuffer() || Buffer.alloc(0);
+      server.tus.push({ method, id, offset, size: body.length });
+      if (server.holdPatch) {
+        const hold = server.holdPatch(offset, id);
+        if (hold) { await hold; return route.abort('failed').catch(() => {}); }
+      }
+      if (server.patchFails > 0) { server.patchFails--; return reply(500, { error: 'server busy' }); }
+      if (offset !== up.received) return reply(409, { error: 'offset mismatch' });
+      assert.ok(body.length === 6 * 1024 * 1024 || offset + body.length === up.length, 'pieces of exactly 6 MB, except the last');
+      up.bytes.push(body);
+      up.received += body.length;
+      if (up.received === up.length) server.objects.set(up.objectName, Buffer.concat(up.bytes));
+      if (server.afterPatch) server.afterPatch(up);
+      return route.fulfill({ status: 204, headers: { ...CORS, 'upload-offset': String(up.received), 'tus-resumable': '1.0.0' } });
+    }
+    return reply(405, {});
+  }
+
+  // --- Edge Functions ---
+  if (url.pathname.startsWith('/functions/v1/')) {
+    const fn = url.pathname.slice('/functions/v1/'.length);
+    const body = JSON.parse(req.postData() || '{}');
+    server.calls.push({ fn, body });
+    if (server.notDeployed) return reply(404, { code: 'NOT_FOUND', message: 'Requested function was not found' });
+    const limit = () => reply(429, { error: 'dailyLimit', message: 'used up', limitMinutes: 60, usedMinutes: 61 });
+    if (fn === 'check-limit') return server.limitReached ? limit() : reply(200, { open: true, limitMinutes: 60, usedMinutes: 3 });
+    if (fn === 'start-job') {
+      if (server.limitReached || server.limitAtStart) return limit();
+      if (!server.objects.has(body.path)) return reply(404, { error: 'notUploaded', message: 'not uploaded' });
+      if (server.startFails > 0) { server.startFails--; return reply(502, { error: 'speechmatics', message: 'Speechmatics could not take this job right now.' }); }
+      const existing = [...server.jobs.entries()].find(([, j]) => j.path === body.path && j.status !== 'rejected');
+      if (existing) return reply(200, { jobId: existing[0], reused: true });
+      const jobId = 'smjob' + server.nextJob++;
+      server.jobs.set(jobId, { path: body.path, seconds: body.seconds, polls: 0, status: 'running', why: server.reject });
+      server.reject = null;
+      return reply(200, { jobId });
+    }
+    const job = server.jobs.get(body.jobId);
+    if (!job) return reply(404, { error: 'unknownJob', message: 'no such job' });
+    if (fn === 'job-status') {
+      job.polls++;
+      if (job.why) { job.status = 'rejected'; return reply(200, { status: 'failed', speechmaticsStatus: 'rejected', duration: null, errors: [job.why] }); }
+      if (job.polls > server.pollsUntilDone) job.status = 'done';
+      return reply(200, { status: job.status === 'done' ? 'done' : 'running', speechmaticsStatus: job.status, duration: null, errors: [] });
+    }
+    if (fn === 'job-result') return job.status === 'done' ? reply(200, server.result) : reply(409, { error: 'notReady' });
+    if (fn === 'delete-audio') { server.objects.delete(job.path); job.deleted = true; return reply(200, { deleted: true }); }
+  }
+  return reply(404, { error: 'unexpected ' + url.pathname });
 }
 
-// A pretend Screen Wake Lock that records what the app does with it.
+// A pretend Screen Wake Lock (the File tab keeps the screen on while it prepares and uploads).
 const WAKE_LOCK = `
   window.__wake = { requests: 0, held: null };
   Object.defineProperty(navigator, 'wakeLock', { value: {
     request: () => {
       window.__wake.requests++;
-      const listeners = [];
-      const lock = {
-        released: false,
-        addEventListener: (t, f) => { if (t === 'release') listeners.push(f); },
-        release: () => { lock.released = true; window.__wake.held = null; listeners.forEach((f) => f()); return Promise.resolve(); },
-        __androidLetsGo: () => { lock.released = true; window.__wake.held = null; listeners.forEach((f) => f()); }
-      };
+      const lock = { released: false, addEventListener: () => {}, release: () => { lock.released = true; window.__wake.held = null; return Promise.resolve(); } };
       window.__wake.held = lock;
       return Promise.resolve(lock);
     }
   }});
+`;
+// Quick waits, so the tests don't sit through real pauses between checks.
+const QUICK = `
+  window.addEventListener('DOMContentLoaded', () => {
+    if (window.FileTab) Object.assign(window.FileTab.TIMING, { pollFirst: 150, poll: 150, pollSlow: 150, retry: 150, busy: 150 });
+    if (window.ResumableUpload) window.ResumableUpload.WAITS.splice(0, 99, 100, 150, 200, 250, 300, 300);
+  });
 `;
 
 // ---------- Helpers ----------
@@ -168,29 +200,35 @@ let browser;
 async function newContext(opts = {}) {
   const context = await browser.newContext({ ...devices['Pixel 7'], acceptDownloads: true, ...opts });
   await context.addInitScript(WAKE_LOCK);
-  await routeModels(context);
+  await context.addInitScript(QUICK);
+  await context.route(SUPABASE + '/**', fakeSupabase);
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
   return context;
 }
 
 async function test(name, fn, { context: makeContext } = {}) {
   if (ONLY && !name.includes(ONLY)) return;
-  net.mode = 'ok';
+  server = freshServer();
   const context = makeContext ? await makeContext() : await newContext();
   const page = context.pages()[0] || await context.newPage();
   const errors = [];
-  const watch = (p) => p.on('pageerror', (e) => errors.push(e.message));
+  const requests = [];
+  const watch = (p) => {
+    p.on('pageerror', (e) => errors.push(e.message));
+    p.on('request', (r) => requests.push(r.url()));
+  };
   watch(page);
   context.on('page', watch);
   const started = Date.now();
   try {
     await page.goto(URL);
-    await fn(page, context);
+    await fn(page, context, requests);
     assert.deepStrictEqual(errors, [], 'page errors: ' + errors.join('; '));
     passed++;
     console.log(`  ok   ${name} (${((Date.now() - started) / 1000).toFixed(1)}s)`);
   } catch (e) {
     failures.push(name);
-    console.log('  FAIL ' + name + '\n       ' + String(e && e.stack || e).split('\n').slice(0, 5).join('\n       '));
+    console.log('  FAIL ' + name + '\n       ' + String(e && e.stack || e).split('\n').slice(0, 6).join('\n       '));
     try { console.log('       status: ' + await page.locator('#file-status').innerText()); } catch (x) { /* ignore */ }
   } finally {
     await context.close().catch(() => {});
@@ -198,59 +236,70 @@ async function test(name, fn, { context: makeContext } = {}) {
 }
 
 const text = (page, sel) => page.locator(sel).innerText();
-const fileText = (page) => page.locator('#file-transcript').inputValue();
+const status = (page) => text(page, '#file-status');
 
-async function openFileTab(page) {
-  await page.click('#tab-file');
-}
+async function openFileTab(page) { await page.click('#tab-file'); }
 
-/** Pick a file the way a person does: tap the button, then choose in the picker. */
 async function chooseFile(page, file) {
   const [chooser] = await Promise.all([page.waitForEvent('filechooser'), page.click('#file-choose')]);
   await chooser.setFiles(file);
 }
 
-async function waitStatus(page, re, timeout = 120000) {
+async function waitStatus(page, re, timeout = 60000) {
   await page.waitForFunction((src) => new RegExp(src, 'i').test(document.getElementById('file-status').textContent),
-    re.source, { timeout, polling: 100 });
+    re.source, { timeout, polling: 50 });
 }
 
-async function transcribe(page, file, { language = 'auto', speed = 'fast', timeout = 240000 } = {}) {
+/** The transcript as it reads on screen, one turn per line. */
+async function screenLines(page) {
+  return page.$$eval('#file-transcript .turn', (ps) => ps.map((p) => p.textContent));
+}
+
+async function transcribe(page, file, opts = {}) {
+  if (opts.result) server.result = opts.result;
   await openFileTab(page);
-  await page.selectOption('#file-language', language);
-  await page.selectOption('#file-speed', speed);
   await chooseFile(page, file);
-  await waitStatus(page, /Ready|long|Tap Start/);
+  await waitStatus(page, /Ready/);
   await page.click('#file-start');
-  await waitStatus(page, /^Done/, timeout);
-  return fileText(page);
+  await waitStatus(page, /^Done/, opts.timeout || 90000);
 }
 
-const lower = (s) => s.toLowerCase().replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+/g, ' ');
+const expectedText = (result, names = {}, times = true) => {
+  const r = F.buildTurns(result);
+  return F.formatTranscript(r.turns, r.speakers, names, times);
+};
 
 // ---------- Tests ----------
 
 (async () => {
-  const files = speechFiles();
-  const server = spawn('python3', ['-m', 'http.server', String(PORT), '--bind', '127.0.0.1'], { cwd: ROOT, stdio: 'ignore' });
+  const files = testFiles();
+  const web = spawn('python3', ['-m', 'http.server', String(PORT), '--bind', '127.0.0.1'], { cwd: ROOT, stdio: 'ignore' });
   await new Promise((r) => setTimeout(r, 800));
   browser = await chromium.launch();
 
   try {
-    console.log('File tab');
+    console.log('English only, Whisper hidden');
 
-    await test('File tab: pickers, title-case labels and the Wi-Fi note', async (page) => {
-      await openFileTab(page);
-      const langs = await page.$$eval('#file-language option', (o) => o.map((x) => x.textContent));
-      assert.deepStrictEqual(langs, ['Auto-Detect', 'English', 'Filipino']);
-      const speeds = await page.$$eval('#file-speed option', (o) => o.map((x) => x.textContent));
-      assert.deepStrictEqual(speeds, ['Fast', 'Accurate']);
-      assert.match(await text(page, '#model-note'), /First time only.*about 70 MB.*Wi-Fi/);
-      await page.selectOption('#file-speed', 'accurate');
-      await page.waitForFunction(() => /about 110 MB/.test(document.getElementById('model-note').textContent));
-      assert.ok(await page.isDisabled('#file-start'));
-      const labels = await page.$$eval('h1, h2, button, label, option, .interim-label', (els) =>
-        els.filter((e) => e.offsetParent !== null || e.tagName === 'OPTION').map((e) => e.textContent.trim()).filter(Boolean));
+    await test('no language pickers, no Auto-Detect, no Filipino, no Whisper anywhere on the screen', async (page, context, requests) => {
+      assert.strictEqual(await page.locator('select').count(), 0, 'no pickers at all');
+      for (const tab of ['#tab-live', '#tab-file']) {
+        await page.click(tab);
+        const all = await page.evaluate(() => document.body.innerText);
+        for (const word of ['Filipino', 'Tagalog', 'Auto-Detect', 'Whisper', 'Language', 'Fast', 'Accurate', 'English (Philippines)']) {
+          assert.ok(!all.includes(word), `"${word}" is on the ${tab} screen`);
+        }
+      }
+      assert.ok(!requests.some((u) => /whisper|transformers|job-store/.test(u)), 'Whisper code is not loaded');
+      assert.ok(fs.existsSync(path.join(ROOT, 'whisper-file.js')) && fs.existsSync(path.join(ROOT, 'whisper-worker.js')), 'but kept in the repository');
+    });
+
+    await test('headings and buttons are in title case, and nothing scrolls sideways', async (page) => {
+      server.result = saved('three-speakers');
+      await transcribe(page, files.jfk);
+      const labels = await page.$$eval('h1, h2, button, label, .interim-label', (els) =>
+        els.filter((e) => e.offsetParent !== null || e.closest('#rename-box'))
+          .filter((e) => !e.classList.contains('turn-time') && !e.closest('.turn'))
+          .map((e) => e.textContent.trim()).filter(Boolean));
       const small = new Set(['a', 'an', 'the', 'and', 'or', 'of', 'to', 'in', 'on', 'for']);
       for (const label of labels) {
         label.split(/[\s-]+/).forEach((word, i) => {
@@ -259,14 +308,17 @@ const lower = (s) => s.toLowerCase().replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+
           assert.ok(/^[A-Z]/.test(w), `"${label}" is not title case`);
         });
       }
+      assert.ok(labels.includes('Show Timestamps') && labels.includes('Rename Speaker 2'), labels.join(' | '));
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
       assert.ok(overflow <= 0, 'sideways scroll ' + overflow);
     });
 
-    await test('English WAV: downloads the model once with progress, transcribes, then says it is ready', async (page) => {
+    console.log('File tab: Speechmatics');
+
+    await test('a file goes all the way: prepare, upload, Speechmatics, numbered turns, sound deleted', async (page) => {
       await openFileTab(page);
       await chooseFile(page, files.jfk);
-      await waitStatus(page, /Ready/);
+      await waitStatus(page, /^Ready/);
       assert.match(await text(page, '#file-details'), /11 seconds/);
       const seen = [];
       await page.exposeFunction('__seen', (t) => seen.push(t));
@@ -274,462 +326,559 @@ const lower = (s) => s.toLowerCase().replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+
         .observe(document.getElementById('file-status'), { childList: true, characterData: true, subtree: true }));
       await page.click('#file-start');
       await waitStatus(page, /^Done/);
-      assert.ok(seen.some((t) => /Downloading the speech model \(first time only\).*MB/.test(t)), 'download progress shown');
-      assert.ok(seen.some((t) => /Transcribing… \d+%/.test(t)), 'percentage shown');
-      const out = lower(await fileText(page));
-      assert.ok(out.includes('ask not what your country can do for you'), out);
-      assert.match(await text(page, '#word-count'), /^2\d Words$/);
-      assert.match(await text(page, '#model-note'), /Fast is downloaded and ready/);
-      await page.selectOption('#file-speed', 'accurate');
-      await page.waitForFunction(() => /Accurate downloads the speech model \(about 80 MB\)/.test(document.getElementById('model-note').textContent));
-      await page.selectOption('#file-speed', 'fast');
-      assert.strictEqual(await page.evaluate(() => document.getElementById('file-progress').value), 100);
-      // A second file: no download this time.
-      seen.length = 0;
-      await chooseFile(page, files.mp3);
-      await page.click('#file-replace-yes');
-      await waitStatus(page, /Ready/);
-      await page.click('#file-start');
-      await waitStatus(page, /^Done/);
-      assert.ok(!seen.some((t) => /Downloading/.test(t)), 'no second download');
+      assert.ok(seen.some((t) => /^Preparing the audio… \d+%/.test(t)), 'preparing shown');
+      assert.ok(seen.some((t) => /^Uploading… \d+% \([\d.]+ of [\d.]+ MB\)/.test(t)), 'upload progress shown');
+      assert.ok(seen.some((t) => /^Speechmatics is transcribing/.test(t)), 'waiting for Speechmatics shown');
+      assert.match(await status(page), /^Done\. Transcribed 11 seconds of audio\.$/);
+      // What was uploaded: a small mono Ogg Opus file of the right length.
+      const [up] = [...server.uploads.values()];
+      const ogg = Buffer.concat(up.bytes);
+      assert.strictEqual(ogg.subarray(0, 4).toString(), 'OggS');
+      const out = path.join(media.DIR, 'uploaded-test.ogg');
+      fs.writeFileSync(out, ogg);
+      const probe = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_name,channels', '-of', 'json', out]).stdout);
+      assert.strictEqual(probe.streams[0].codec_name, 'opus');
+      assert.strictEqual(probe.streams[0].channels, 1);
+      assert.ok(Math.abs(Number(probe.format.duration) - 11) < 0.1, probe.format.duration);
+      assert.ok(ogg.length < 11 * 4000, ogg.length + ' bytes');
+      // The job was started once, with the length, and the sound deleted after the transcript was saved.
+      assert.strictEqual(fnCalls('check-limit').length, 1);
+      assert.strictEqual(fnCalls('start-job').length, 1);
+      assert.strictEqual(fnCalls('start-job')[0].body.path, up.objectName);
+      assert.strictEqual(fnCalls('start-job')[0].body.seconds, 11);
+      await page.waitForFunction(() => true);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.strictEqual(fnCalls('delete-audio').length, 1);
+      assert.ok(!server.objects.has(up.objectName), 'deleted from storage');
+      // The transcript, exactly as section 3 asks.
+      assert.deepStrictEqual(await screenLines(page), expectedText(saved('two-speakers')).split('\n'));
+      assert.strictEqual(await text(page, '#word-count'), F.countWords(F.buildTurns(saved('two-speakers')).turns) + ' Words');
+      assert.ok(await page.evaluate(() => window.__wake.held === null), 'screen allowed to sleep again');
     });
 
-    for (const [label, key] of [['MP3', 'mp3'], ['M4A', 'm4a'], ['OGG (Opus)', 'ogg'], ['WEBM audio', 'webm'], ['FLAC', 'flac'], ['AAC', 'aac']]) {
-      await test(`${label}: transcribed`, async (page) => {
-        const out = lower(await transcribe(page, files[key], { language: 'english' }));
-        assert.ok(out.includes('my fellow americans') && out.includes('your country'), out);
-        assert.ok(!/Video/.test(await text(page, '#file-details')));
-      });
-    }
-
-    await test('MP4 video (H.264 + AAC): only the sound is used', async (page) => {
-      const out = lower(await transcribe(page, files.interview));
-      assert.match(await text(page, '#file-details'), /Video \(sound only\)/);
-      assert.ok(out.split(' ').length > 40, out);
-    });
-
-    await test('WEBM video (VP9 + Opus): only the sound is used', async (page) => {
-      const out = lower(await transcribe(page, files.hopper));
-      assert.match(await text(page, '#file-details'), /Video \(sound only\)/);
-      assert.ok(out.split(' ').length > 30, out);
-    });
-
-    await test('MOV video: only the sound is used', async (page) => {
-      const out = lower(await transcribe(page, files.mov));
-      assert.match(await text(page, '#file-details'), /Video \(sound only\)/);
-      assert.ok(out.includes('fellow americans'), out);
-    });
-
-    await test('Filipino with Auto-Detect on Accurate', async (page) => {
-      const out = lower(await transcribe(page, files.fil, { speed: 'accurate' }));
-      assert.ok(/\bang\b/.test(out) && /\bng\b|\bna\b|\bmga\b/.test(out), 'looks like Filipino: ' + out);
-      assert.ok(/(malalaking|kagubatan|kegubatan|populasyon|pinagbago|pulis)/.test(out), out);
-    });
-
-    await test('Filipino chosen by hand on Fast', async (page) => {
-      const out = lower(await transcribe(page, files.fil, { language: 'tagalog' }));
-      assert.ok(/\bang\b/.test(out), out);
-    });
-
-    await test('timestamps: shown beside each section and can be turned off', async (page) => {
-      await openFileTab(page);
-      await page.check('#file-timestamps');
-      await transcribe(page, files.ted, { language: 'english' });
-      const lines = (await fileText(page)).split('\n').filter(Boolean);
-      assert.ok(lines.length >= 2, 'several sections');
-      assert.match(lines[0], /^\[0:00\] \S/);
-      lines.forEach((l) => assert.match(l, /^\[\d:\d\d\] /));
-      const words = Number((await text(page, '#word-count')).split(' ')[0]);
-      await page.uncheck('#file-timestamps');
-      const plain = (await fileText(page)).split('\n').filter(Boolean);
-      assert.strictEqual(plain.length, lines.length);
-      plain.forEach((l) => assert.ok(!/^\[/.test(l), l));
-      assert.strictEqual(Number((await text(page, '#word-count')).split(' ')[0]), words, 'timestamps are not counted as words');
-      // Settings are remembered.
-      await page.check('#file-timestamps');
+    await test('Copy and Download keep whichever view is showing (with or without times)', async (page) => {
+      const result = saved('many-overlaps');
+      await transcribe(page, files.jfk, { result });
+      const withTimes = expectedText(result);
+      assert.ok(await page.isChecked('#file-timestamps'), 'times shown at first');
+      await page.click('#copy-button');
+      await page.waitForFunction(() => /Copied/.test(document.getElementById('output-status').textContent));
+      assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), withTimes);
+      let [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-button')]);
+      assert.match(download.suggestedFilename(), /^transcript-jfk-\d{4}-\d\d-\d\d_\d\d-\d\d\.txt$/);
+      assert.strictEqual(fs.readFileSync(await download.path(), 'utf8').replace(/\r\n/g, '\n').trim(), withTimes);
+      // Hide the times: nothing is transcribed again.
+      const startsBefore = fnCalls('start-job').length + fnCalls('job-result').length;
+      await page.click('.switch');
+      assert.ok(!(await page.isChecked('#file-timestamps')));
+      const plain = expectedText(result, {}, false);
+      assert.deepStrictEqual(await screenLines(page), plain.split('\n'));
+      assert.strictEqual(await page.locator('.turn-time').count(), 0);
+      await page.click('#copy-button');
+      await page.waitForFunction(() => /Copied/.test(document.getElementById('output-status').textContent));
+      assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), plain);
+      [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-button')]);
+      assert.strictEqual(fs.readFileSync(await download.path(), 'utf8').replace(/\r\n/g, '\n').trim(), plain);
+      assert.strictEqual(fnCalls('start-job').length + fnCalls('job-result').length, startsBefore, 'not transcribed again');
+      // The choice is remembered.
       await page.reload();
       await openFileTab(page);
-      assert.ok(await page.isChecked('#file-timestamps'));
-      assert.match((await fileText(page)).split('\n')[0], /^\[0:00\]/);
+      await page.waitForSelector('#file-transcript .turn');
+      assert.ok(!(await page.isChecked('#file-timestamps')));
+      assert.deepStrictEqual(await screenLines(page), plain.split('\n'));
     });
 
-    await test('the screen never freezes while Whisper works', async (page) => {
+    await test('renaming a speaker changes every label for that speaker, and is saved', async (page) => {
+      const result = saved('many-overlaps');
+      await transcribe(page, files.jfk, { result });
+      // Tap a speaker's name in the transcript.
+      await page.locator('.turn-speaker', { hasText: 'Speaker 2' }).first().click();
+      assert.ok(await page.isVisible('#rename-box'));
+      assert.match(await text(page, '#rename-label'), /^New Name for Speaker 2$/);
+      await page.fill('#rename-input', '  Maria  ');
+      await page.click('#rename-save');
+      const expected = expectedText(result, { S2: 'Maria' });
+      assert.deepStrictEqual(await screenLines(page), expected.split('\n'));
+      assert.strictEqual((await screenLines(page)).filter((l) => /Speaker 2/.test(l)).length, 0);
+      assert.strictEqual((await screenLines(page)).filter((l) => /Maria/.test(l)).length, 6);
+      assert.match(await status(page), /Renamed.*“Maria”/);
+      // The speaker buttons, and Copy.
+      assert.deepStrictEqual(await page.$$eval('#speaker-list button', (b) => b.map((x) => x.textContent)), ['Rename Speaker 1', 'Rename Maria']);
+      await page.click('#copy-button');
+      await page.waitForFunction(() => /Copied/.test(document.getElementById('output-status').textContent));
+      assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), expected);
+      // Speaker 1 with the button and Enter.
+      await page.click('#speaker-list button >> text=Rename Speaker 1');
+      await page.fill('#rename-input', 'Ana');
+      await page.press('#rename-input', 'Enter');
+      assert.deepStrictEqual(await screenLines(page), expectedText(result, { S1: 'Ana', S2: 'Maria' }).split('\n'));
+      // Survives a reload.
+      await page.reload();
       await openFileTab(page);
-      await chooseFile(page, files.ted);
-      await waitStatus(page, /Ready/);
-      await page.evaluate(() => {
-        window.__gaps = [];
-        let last = performance.now();
-        window.__tick = setInterval(() => { const now = performance.now(); window.__gaps.push(now - last); last = now; }, 50);
+      await page.waitForSelector('#file-transcript .turn');
+      assert.deepStrictEqual(await screenLines(page), expectedText(result, { S1: 'Ana', S2: 'Maria' }).split('\n'));
+      // An empty name goes back to the number; Cancel changes nothing.
+      await page.click('#speaker-list button >> text=Rename Maria');
+      assert.match(await text(page, '#rename-label'), /Speaker 2 \(Now “Maria”\)/);
+      await page.fill('#rename-input', '');
+      await page.click('#rename-save');
+      await page.click('#speaker-list button >> text=Rename Ana');
+      await page.fill('#rename-input', 'Nobody');
+      await page.click('#rename-cancel');
+      assert.deepStrictEqual(await screenLines(page), expectedText(result, { S1: 'Ana' }).split('\n'));
+    });
+
+    await test('tapping a timestamp plays the chosen file from that moment', async (page) => {
+      const result = B.build([
+        { speaker: 'S1', at: 1.2, say: 'And so my fellow Americans,' },
+        { speaker: 'S2', at: 6.4, say: 'Ask not what your country can do for you.' }
+      ]);
+      await transcribe(page, files.jfk, { result });
+      await page.locator('.turn-time').nth(1).click();
+      await page.waitForFunction(() => !document.getElementById('file-player').paused, null, { timeout: 5000 });
+      const t = await page.evaluate(() => document.getElementById('file-player').currentTime);
+      assert.ok(t >= 6.3 && t < 7.5, 'playing from ' + t);
+      assert.ok(await page.isVisible('#file-player'));
+      assert.ok(await page.locator('.turn.is-playing').count() === 1);
+      await page.locator('.turn-time').nth(0).click();
+      await page.waitForFunction(() => document.getElementById('file-player').currentTime < 3, null, { timeout: 5000 });
+      // After a reload the file is not chosen any more: say how to play it.
+      await page.reload();
+      await openFileTab(page);
+      await page.waitForSelector('.turn-time');
+      await page.locator('.turn-time').first().click();
+      await waitStatus(page, /To play the recording from this moment, choose “jfk\.wav” again/);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /Already transcribed/);
+      await page.locator('.turn-time').nth(1).click();
+      await page.waitForFunction(() => !document.getElementById('file-player').paused, null, { timeout: 5000 });
+      assert.strictEqual(fnCalls('start-job').length, 1, 'choosing it again did not send it again');
+    });
+
+    await test('a video file: only its sound is prepared and uploaded, and it plays from a timestamp', async (page) => {
+      await transcribe(page, files.courtroom, { result: saved('three-speakers') });
+      assert.match(await text(page, '#file-details'), /Video \(sound only\)/);
+      const [up] = [...server.uploads.values()];
+      assert.strictEqual(Buffer.concat(up.bytes).subarray(0, 4).toString(), 'OggS');
+      await page.locator('.turn-time').nth(2).click();
+      await page.waitForFunction(() => !document.getElementById('file-player').paused, null, { timeout: 5000 });
+    });
+
+    await test('editing a turn keeps the format; edits survive a reload and the timestamps switch', async (page) => {
+      const result = saved('two-speakers');
+      await transcribe(page, files.jfk, { result });
+      const turn = page.locator('.turn-text').first();
+      await turn.click();
+      await page.keyboard.press('Control+End');
+      await page.keyboard.type(' (Edited.)');
+      await page.keyboard.press('Enter');
+      const lines = await screenLines(page);
+      assert.strictEqual(lines[0], '1. [00:00:05 – 00:00:07] Speaker 1: Good morning. Thanks for coming in today. (Edited.)');
+      await page.waitForTimeout(600);
+      await page.reload();
+      await openFileTab(page);
+      await page.waitForSelector('.turn');
+      assert.deepStrictEqual(await screenLines(page), lines);
+      await page.click('.switch');
+      assert.strictEqual((await screenLines(page))[0], '1. Speaker 1: Good morning. Thanks for coming in today. (Edited.)');
+    });
+
+    await test('a 2-hour transcript shows quickly and in order', async (page) => {
+      const result = B.twoHours();
+      await transcribe(page, files.jfk, { result });
+      const expected = expectedText(result).split('\n');
+      const shown = await screenLines(page);
+      assert.strictEqual(shown.length, expected.length);
+      assert.deepStrictEqual(shown.slice(0, 10), expected.slice(0, 10));
+      assert.deepStrictEqual(shown.slice(-5), expected.slice(-5));
+      const ms = await page.evaluate(() => {
+        const t = performance.now();
+        document.getElementById('file-timestamps').click();
+        document.getElementById('file-timestamps').click();
+        return performance.now() - t;
       });
-      await page.click('#file-start');
-      await waitStatus(page, /^Done/);
-      const worst = await page.evaluate(() => { clearInterval(window.__tick); return Math.max(...window.__gaps); });
-      assert.ok(worst < 400, `the page was stuck for ${Math.round(worst)} ms`);
+      assert.ok(ms < 1500, `switching timestamps took ${Math.round(ms)} ms`);
+      console.log(`       ${shown.length} turns; timestamps off and on again in ${Math.round(ms)} ms`);
     });
 
-    await test('Keep Screen On: held while transcribing, asked again when Android lets go, released after', async (page) => {
-      await openFileTab(page);
-      await chooseFile(page, files.long40);
-      await waitStatus(page, /long/);
-      await page.click('#file-start');
-      await waitStatus(page, /Transcribing… \d+%/);
-      assert.ok(await page.evaluate(() => window.__wake.held && !window.__wake.held.released), 'screen kept on');
-      const before = await page.evaluate(() => window.__wake.requests);
-      await page.evaluate(() => window.__wake.held.__androidLetsGo());
-      await page.waitForFunction((n) => window.__wake.requests > n && window.__wake.held, before, { timeout: 8000 });
-      // Hidden then visible again (switching apps): asked again.
-      await page.evaluate(() => {
-        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
-        window.__wake.held && window.__wake.held.__androidLetsGo();
-        document.dispatchEvent(new Event('visibilitychange'));
-        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
-        document.dispatchEvent(new Event('visibilitychange'));
-      });
-      await page.waitForFunction(() => window.__wake.held, null, { timeout: 8000 });
-      await page.click('#file-cancel');
-      await waitStatus(page, /^Stopped/);
-      assert.strictEqual(await page.evaluate(() => window.__wake.held), null, 'released after stopping');
-    });
+    console.log('Carrying on after an interruption, never paying twice');
 
-    await test('Cancel stops, keeps what is done, and Continue carries on without repeats', async (page) => {
+    await test('the app closes mid-upload: the same file carries on from the last piece, not from the start', async (page, context) => {
       await openFileTab(page);
-      await page.check('#file-timestamps');
-      await chooseFile(page, files.long40);
-      await waitStatus(page, /40 minutes long.*long time.*same file again/);
+      await chooseFile(page, files.long);
+      await waitStatus(page, /^Ready/);
+      // Close the app as soon as the first 6 MB piece is in.
+      let closed;
+      const firstPiece = new Promise((r) => { closed = r; });
+      server.afterPatch = (up) => { if (up.received >= 6 * 1024 * 1024) closed(); };
+      server.holdPatch = (offset) => (offset >= 6 * 1024 * 1024 ? new Promise(() => {}) : null);
       await page.click('#file-start');
-      await page.waitForFunction(() => document.getElementById('file-transcript').value.split('\n').filter(Boolean).length >= 2,
-        null, { timeout: 120000 });
-      await page.click('#file-cancel');
-      await waitStatus(page, /Stopped at \d+:\d\d of 40:00/);
-      assert.strictEqual(await text(page, '#file-start-label'), 'Continue Transcribing');
-      assert.ok(await page.isVisible('#file-start'));
-      assert.ok(!(await page.isVisible('#file-cancel')));
-      const stoppedLines = (await fileText(page)).split('\n').filter(Boolean);
-      await page.click('#file-start');
-      await page.waitForFunction((n) => document.getElementById('file-transcript').value.split('\n').filter(Boolean).length >= n + 1,
-        stoppedLines.length, { timeout: 120000 });
-      await page.click('#file-cancel');
-      await waitStatus(page, /Stopped at/);
-      const lines = (await fileText(page)).split('\n').filter(Boolean);
-      const stamps = lines.map((l) => l.match(/^\[(\d+):(\d\d)\]/)).map((m) => Number(m[1]) * 60 + Number(m[2]));
-      for (let i = 1; i < stamps.length; i++) assert.ok(stamps[i] > stamps[i - 1], 'no repeated sections: ' + stamps.join(','));
-      assert.deepStrictEqual(lines.slice(0, stoppedLines.length), stoppedLines);
-    });
-
-    await test('app closed mid-way: message on return, same file resumes from the saved section', async (page, context) => {
-      await openFileTab(page);
-      await page.check('#file-timestamps');
-      await chooseFile(page, files.long40);
-      await waitStatus(page, /long/);
-      await page.click('#file-start');
-      await page.waitForFunction(() => document.getElementById('file-transcript').value.split('\n').filter(Boolean).length >= 3,
-        null, { timeout: 120000 });
-      const savedLines = (await fileText(page)).split('\n').filter(Boolean);
-      // The app closes (tab killed) while working.
+      await firstPiece;
+      await page.waitForTimeout(300);
       await page.close({ runBeforeUnload: false });
+      server.holdPatch = null;
+      server.afterPatch = null;
+      const creates = server.tus.filter((t) => t.method === 'POST').length;
       const again = await context.newPage();
       await again.goto(URL);
       await openFileTab(again);
-      await waitStatus(again, /stopped at \d+:\d\d of 40:00 when the app closed.*same file again/);
-      const restored = (await fileText(again)).split('\n').filter(Boolean);
-      assert.ok(restored.length >= savedLines.length, 'transcript survived');
-      await chooseFile(again, files.long40);
-      await again.waitForFunction(() => !document.getElementById('file-resume').hidden);
-      assert.match(await text(again, '#file-resume-text'), /Continuing where you left off\. The first \d+:\d\d of 40:00 was already transcribed/);
-      await waitStatus(again, /Transcribing… \d+% \(\d+:\d\d of 40:00\)/);
-      await again.waitForFunction((n) => document.getElementById('file-transcript').value.split('\n').filter(Boolean).length >= n + 1,
-        restored.length, { timeout: 120000 });
-      await again.click('#file-cancel');
-      await waitStatus(again, /Stopped at/);
-      const lines = (await fileText(again)).split('\n').filter(Boolean);
-      const stamps = lines.map((l) => { const m = l.match(/^\[(\d+):(\d\d)\]/); return Number(m[1]) * 60 + Number(m[2]); });
-      for (let i = 1; i < stamps.length; i++) assert.ok(stamps[i] > stamps[i - 1], 'no repeats: ' + stamps.join(','));
-      assert.deepStrictEqual(lines.slice(0, savedLines.length), savedLines, 'kept the earlier sections');
+      await waitStatus(again, /stopped when the app closed\. Choose the same file again/);
+      const seen = [];
+      await again.exposeFunction('__seen', (t) => seen.push(t));
+      await again.evaluate(() => new MutationObserver(() => window.__seen(document.getElementById('file-status').textContent))
+        .observe(document.getElementById('file-status'), { childList: true, characterData: true, subtree: true }));
+      await chooseFile(again, files.long);
+      await again.waitForFunction(() => /Continuing where you left off/.test(document.getElementById('file-resume-text').textContent));
+      await waitStatus(again, /^Done/, 120000);
+      assert.ok(!seen.some((t) => /Preparing/.test(t)), 'not prepared again (kept on the device)');
+      assert.strictEqual(server.tus.filter((t) => t.method === 'POST').length, creates, 'no new upload started');
+      const head = server.tus.find((t) => t.method === 'HEAD');
+      assert.ok(head && head.offset === 6 * 1024 * 1024, 'asked where to carry on: ' + JSON.stringify(head));
+      const afterHead = server.tus.slice(server.tus.indexOf(head) + 1).filter((t) => t.method === 'PATCH');
+      assert.ok(afterHead.every((t) => t.offset >= 6 * 1024 * 1024), 'nothing sent twice');
+      const [up] = [...server.uploads.values()];
+      assert.strictEqual(up.received, up.length);
+      assert.strictEqual(fnCalls('start-job').length, 1);
     });
 
-    await test('phone restart (browser fully closed): same file resumes', async () => {
+    await test('the app closes while Speechmatics works: reopening collects the transcript, no file needed, paid once', async (page, context) => {
+      server.pollsUntilDone = 1000;   // Speechmatics takes a long time
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /Speechmatics is transcribing/);
+      assert.ok(!(await page.isVisible('#file-cancel')), 'nothing to cancel once Speechmatics has it');
+      await page.close({ runBeforeUnload: false });
+      // Speechmatics finishes while the app is closed.
+      [...server.jobs.values()][0].polls = 2000;
+      const again = await context.newPage();
+      await again.goto(URL);
+      await openFileTab(again);
+      await waitStatus(again, /^Done/);
+      assert.deepStrictEqual(await screenLines(again), expectedText(saved('two-speakers')).split('\n'));
+      assert.strictEqual(fnCalls('start-job').length, 1, 'started once');
+      await again.waitForTimeout(300);
+      assert.strictEqual(fnCalls('delete-audio').length, 1);
+      // And choosing the file again later: the saved transcript, nothing sent.
+      await chooseFile(again, files.jfk);
+      await waitStatus(again, /Already transcribed/);
+      assert.match(await text(again, '#file-resume-text'), /already transcribed.*not sent again/);
+      assert.ok(await again.isDisabled('#file-start'));
+      assert.strictEqual(fnCalls('start-job').length, 1);
+      assert.strictEqual(server.uploads.size, 1);
+    });
+
+    await test('phone restart (browser fully closed) while uploading: carries on', async () => {
+      const os = require('os');
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-profile-'));
       const launch = async () => {
         const ctx = await chromium.launchPersistentContext(dir, { ...devices['Pixel 7'] });
         await ctx.addInitScript(WAKE_LOCK);
-        await routeModels(ctx);
+        await ctx.addInitScript(QUICK);
+        await ctx.route(SUPABASE + '/**', fakeSupabase);
         return ctx;
       };
       let ctx = await launch();
-      let page = ctx.pages()[0] || await ctx.newPage();
-      await page.goto(URL);
-      await openFileTab(page);
-      await chooseFile(page, files.long40);
-      await waitStatus(page, /long/);
-      await page.click('#file-start');
-      await page.waitForFunction(() => document.getElementById('file-transcript').value.trim().length > 50, null, { timeout: 120000 });
-      await page.waitForTimeout(500);
-      await ctx.close();                       // everything shuts down
-      ctx = await launch();                    // and starts again later
       try {
+        let page = ctx.pages()[0] || await ctx.newPage();
+        await page.goto(URL);
+        await openFileTab(page);
+        await chooseFile(page, files.long);
+        await waitStatus(page, /^Ready/);
+        let gotPiece;
+        const piece = new Promise((r) => { gotPiece = r; });
+        server.afterPatch = (up) => { if (up.received >= 6 * 1024 * 1024) gotPiece(); };
+        server.holdPatch = (offset) => (offset >= 6 * 1024 * 1024 ? new Promise(() => {}) : null);
+        await page.click('#file-start');
+        await piece;
+        await page.waitForTimeout(500);
+        await ctx.close();
+        server.holdPatch = null;
+        server.afterPatch = null;
+        ctx = await launch();
         page = ctx.pages()[0] || await ctx.newPage();
         await page.goto(URL);
         await openFileTab(page);
-        await waitStatus(page, /when the app closed/);
-        await chooseFile(page, files.long40);
-        await page.waitForFunction(() => /Continuing where you left off/.test(document.getElementById('file-resume-text').textContent));
-        await waitStatus(page, /Transcribing… [1-9]?\d% \((?!0:00)\d+:\d\d of 40:00\)/);
-        await page.click('#file-cancel');
-        await waitStatus(page, /Stopped at/);
+        await waitStatus(page, /stopped when the app closed/);
+        await chooseFile(page, files.long);
+        await waitStatus(page, /^Done/, 120000);
+        assert.strictEqual(server.uploads.size, 1, 'the same upload, carried on');
+        assert.strictEqual(fnCalls('start-job').length, 1);
       } finally {
-        await ctx.close();
+        await ctx.close().catch(() => {});
         fs.rmSync(dir, { recursive: true, force: true });
       }
-    }, { context: () => newContext() });
-
-    await test('Start Over transcribes again from the beginning', async (page) => {
-      await transcribe(page, files.jfk, { language: 'english' });
-      await chooseFile(page, files.jfk);
-      await page.waitForFunction(() => /already transcribed/.test(document.getElementById('file-resume-text').textContent));
-      assert.ok(await page.isDisabled('#file-start'));
-      assert.ok((await fileText(page)).length > 20, 'saved transcript shown');
-      await page.click('#file-start-over');
-      await waitStatus(page, /^Done/);
-      const out = lower(await fileText(page));
-      assert.strictEqual(out.split('ask not what').length - 1, 1, 'transcribed once, not twice: ' + out);
     });
 
-    await test('Start Over tapped twice: transcribed once, not wiped later', async (page) => {
+    await test('internet cut during the upload: waits, then carries on from the last piece', async (page, context) => {
       await openFileTab(page);
-      await chooseFile(page, files.ted);
-      await waitStatus(page, /Ready/);
+      await chooseFile(page, files.long);
+      await waitStatus(page, /^Ready/);
+      let release;
+      server.holdPatch = (offset) => (offset >= 6 * 1024 * 1024 ? new Promise((r) => { release = r; }) : null);
       await page.click('#file-start');
-      await page.waitForFunction(() => document.getElementById('file-transcript').value.length > 0, null, { timeout: 60000 });
-      await page.evaluate(() => { const f = window.transcriberApp.file; f.startOver(); f.startOver(); });
-      await waitStatus(page, /^Done/);
-      const done = await fileText(page);
-      await page.waitForTimeout(1500);
-      assert.strictEqual(await fileText(page), done, 'not cleared again afterwards');
-      assert.match(await text(page, '#file-status'), /^Done/);
-      const firstLine = done.split('\n')[0];
-      assert.strictEqual(done.split(firstLine).length - 1, 1, 'first section appears once');
+      await page.waitForFunction(() => /Uploading… \d+%/.test(document.getElementById('file-status').textContent));
+      await new Promise((r) => { const t = setInterval(() => { if (release) { clearInterval(t); r(); } }, 50); });
+      server.holdPatch = null;
+      await context.setOffline(true);
+      release();
+      await waitStatus(page, /No internet connection\. Waiting for it to come back\. The upload will carry on from where it stopped/, 30000);
+      assert.strictEqual(await page.getAttribute('#file-status', 'data-kind'), 'warn');
+      await page.waitForTimeout(500);
+      await context.setOffline(false);
+      await waitStatus(page, /^Done/, 120000);
+      const [up] = [...server.uploads.values()];
+      assert.strictEqual(server.uploads.size, 1, 'same upload');
+      assert.strictEqual(up.received, up.length);
+      const resent = server.tus.filter((t) => t.method === 'PATCH' && t.offset === 0).length;
+      assert.strictEqual(resent, 1, 'the first piece was not sent again');
+      const ogg = Buffer.concat(up.bytes);
+      const out = path.join(media.DIR, 'uploaded-after-cut.ogg');
+      fs.writeFileSync(out, ogg);
+      const dur = Number(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', out]).stdout);
+      assert.ok(Math.abs(dur - 2400) < 1, 'the whole recording arrived intact: ' + dur);
     });
 
-    await test('Start is blocked while a new file is still opening', async (page) => {
+    await test('Cancel while uploading keeps the progress; Continue Transcribing carries on', async (page) => {
       await openFileTab(page);
-      await chooseFile(page, files.jfk);
-      await waitStatus(page, /Ready/);
-      await page.setInputFiles('#file-input', files.long40);
-      const started = await page.evaluate(() => { window.transcriberApp.file.start(); return window.transcriberApp.file.running; });
-      assert.strictEqual(started, false);
-      await waitStatus(page, /long/);
-      assert.strictEqual(await text(page, '#file-name'), 'speech-40min.mp3');
+      await chooseFile(page, files.long);
+      await waitStatus(page, /^Ready/);
+      let hold;
+      server.holdPatch = (offset) => (offset >= 6 * 1024 * 1024 ? new Promise((r) => { hold = r; }) : null);
+      await page.click('#file-start');
+      await new Promise((r) => { const t = setInterval(() => { if (hold) { clearInterval(t); r(); } }, 50); });
+      server.holdPatch = null;
+      await page.click('#file-cancel');
+      hold();
+      await waitStatus(page, /^Stopped\. The upload so far is saved\. Tap Continue Transcribing/);
+      assert.strictEqual(await text(page, '#file-start-label'), 'Continue Transcribing');
+      await page.click('#file-start');
+      await waitStatus(page, /^Done/, 120000);
+      assert.strictEqual(server.uploads.size, 1);
+      assert.strictEqual(fnCalls('start-job').length, 1);
+    });
+
+    await test('Start Over during an upload begins a fresh upload', async (page) => {
+      await openFileTab(page);
+      await chooseFile(page, files.long);
+      await waitStatus(page, /^Ready/);
+      let hold;
+      server.holdPatch = (offset) => (offset >= 6 * 1024 * 1024 ? new Promise((r) => { hold = r; }) : null);
+      await page.click('#file-start');
+      await new Promise((r) => { const t = setInterval(() => { if (hold) { clearInterval(t); r(); } }, 50); });
+      server.holdPatch = null;
+      await page.click('#file-cancel');
+      hold();
+      await waitStatus(page, /^Stopped/);
+      await page.reload();
+      await openFileTab(page);
+      // Carrying on starts by itself; keep that upload waiting so Start Over has something to stop.
+      server.holdPatch = (offset, id) => (id === 'up1' && offset >= 6 * 1024 * 1024 ? new Promise(() => {}) : null);
+      await chooseFile(page, files.long);
+      await page.waitForFunction(() => !document.getElementById('file-start-over').hidden);
+      await page.waitForFunction(() => /Uploading/.test(document.getElementById('file-status').textContent));
+      await page.click('#file-start-over');
+      await waitStatus(page, /^Done/, 120000);
+      assert.strictEqual(server.uploads.size >= 2, true, 'a new upload');
+      assert.strictEqual(fnCalls('start-job').length, 1);
     });
 
     console.log('Problems, in plain words');
 
-    await test('a text file: "not supported"', async (page) => {
-      await openFileTab(page);
-      await chooseFile(page, files.text);
-      await waitStatus(page, /This file type is not supported/);
-      assert.strictEqual(await page.getAttribute('#file-status', 'data-kind'), 'error');
-      assert.ok(await page.isDisabled('#file-start'));
-    });
-
-    await test('a damaged file: "could not be read"', async (page) => {
-      await openFileTab(page);
-      await chooseFile(page, files.broken);
-      await waitStatus(page, /could not be read|not supported/);
-    });
-
-    await test('a video with no sound: says so', async (page) => {
-      await openFileTab(page);
-      await chooseFile(page, files.noSound);
-      await waitStatus(page, /no sound to transcribe/);
-    });
-
-    await test('no internet on first use: says to connect, names the download size', async (page, context) => {
+    await test('no internet: says so, and works once back online', async (page, context) => {
       await openFileTab(page);
       await chooseFile(page, files.jfk);
-      await waitStatus(page, /Ready/);
+      await waitStatus(page, /^Ready/);
       await context.setOffline(true);
       await page.click('#file-start');
-      await waitStatus(page, /No internet connection\. The first time you use Fast.*about 70 MB.*Wi-Fi/);
-      assert.ok(await page.isEnabled('#file-start'), 'can try again');
+      await waitStatus(page, /^No internet connection\. Connect to the internet.*Continue Transcribing.*Nothing done so far is lost/);
+      assert.strictEqual(await page.getAttribute('#file-status', 'data-kind'), 'error');
+      assert.ok(await page.isEnabled('#file-start'));
       await context.setOffline(false);
       await page.click('#file-start');
       await waitStatus(page, /^Done/);
     });
 
-    await test('model download fails: plain message, can try again', async (page) => {
+    await test('upload failed: plain message, Continue Transcribing carries on', async (page) => {
+      server.patchFails = 100;
       await openFileTab(page);
       await chooseFile(page, files.jfk);
-      await waitStatus(page, /Ready/);
-      net.mode = 'fail';
+      await waitStatus(page, /^Ready/);
       await page.click('#file-start');
-      await waitStatus(page, /could not be downloaded.*internet/);
-      net.mode = 'ok';
+      await waitStatus(page, /^The upload failed\. Check your internet connection and tap Continue Transcribing/, 30000);
+      assert.strictEqual(await text(page, '#file-start-label'), 'Continue Transcribing');
+      server.patchFails = 0;
       await page.click('#file-start');
       await waitStatus(page, /^Done/);
+      assert.strictEqual(server.uploads.size, 1, 'the same upload carried on');
     });
 
-    await test('not enough memory: plain message, progress kept', async (page, context) => {
-      // Swap in a worker that runs out of memory on the third piece.
-      await context.route('**/whisper-worker.js', async (route) => {
-        const src = fs.readFileSync(path.join(ROOT, 'whisper-worker.js'), 'utf8').replace(
-          'const result = await transcribe(msg);',
-          'if (msg.id === 3) throw new RangeError("Array buffer allocation failed"); const result = await transcribe(msg);');
-        await route.fulfill({ status: 200, headers: { 'content-type': 'text/javascript' }, body: src });
-      });
+    await test('Speechmatics failed: plain message, Try Again works', async (page) => {
+      server.startFails = 1;
       await openFileTab(page);
-      await chooseFile(page, files.long40);
-      await waitStatus(page, /long/);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
       await page.click('#file-start');
-      await waitStatus(page, /ran out of memory\. Close other apps.*progress is saved/);
+      await waitStatus(page, /^Speechmatics could not transcribe this recording right now\. Wait a few minutes, then tap Try Again/);
+      assert.strictEqual(await text(page, '#file-start-label'), 'Try Again');
+      await page.click('#file-start');
+      await waitStatus(page, /^Done/);
+      assert.strictEqual(server.uploads.size, 1, 'not uploaded again');
+    });
+
+    await test('Speechmatics rejects the recording part-way: says why, Try Again starts a new job', async (page) => {
+      server.reject = 'Unable to read the audio';
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /^Speechmatics could not transcribe this recording \(it said: “Unable to read the audio”\)\. Tap Try Again/);
+      await page.click('#file-start');
+      await waitStatus(page, /^Done/);
+      assert.strictEqual(fnCalls('start-job').length, 2);
+      assert.strictEqual(server.uploads.size, 1);
+    });
+
+    await test('daily limit reached: plain message before anything is prepared or uploaded', async (page) => {
+      server.limitReached = true;
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /^Today’s transcription time is used up\. This app can send 60 minutes of recordings a day to Speechmatics \(for everyone together\).*try again tomorrow/);
+      assert.strictEqual(server.uploads.size, 0, 'nothing uploaded');
+      assert.strictEqual(fnCalls('start-job').length, 0);
+    });
+
+    await test('daily limit reached while uploading: same message; tomorrow it carries on without uploading again', async (page) => {
+      server.limitAtStart = true;
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /^Today’s transcription time is used up/);
       assert.strictEqual(await text(page, '#file-start-label'), 'Continue Transcribing');
-      assert.ok((await fileText(page)).trim().length > 20, 'earlier pieces kept');
+      server.limitAtStart = false;
+      await page.click('#file-start');
+      await waitStatus(page, /^Done/);
+      assert.strictEqual(server.uploads.size, 1);
+    });
+
+    await test('file not supported: says so', async (page) => {
+      await openFileTab(page);
+      await chooseFile(page, files.text);
+      await waitStatus(page, /^This file type is not supported/);
+      assert.strictEqual(await page.getAttribute('#file-status', 'data-kind'), 'error');
+      assert.ok(await page.isDisabled('#file-start'));
+    });
+
+    await test('service not set up yet (functions not deployed): says so', async (page) => {
+      server.notDeployed = true;
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
+      await page.click('#file-start');
+      await waitStatus(page, /^The transcription service is not set up yet/);
     });
 
     console.log('Output tools');
 
-    await test('Live: word count, Copy, Download (.txt with date and time), Clear with confirm, survives refresh', async (page, context) => {
-      await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://localhost:${PORT}` });
+    await test('Live: word count, Copy, Download (.txt with date and time), Clear with confirm, survives refresh', async (page) => {
       assert.ok(await page.isDisabled('#copy-button'), 'nothing to copy yet');
-      await page.fill('#transcript', 'Magandang umaga po. This is a test.');
-      assert.strictEqual(await text(page, '#word-count'), '7 Words');
+      await page.fill('#transcript', 'Good morning to you. This is a test.');
+      assert.strictEqual(await text(page, '#word-count'), '8 Words');
       await page.click('#copy-button');
       await page.waitForFunction(() => /Copied/.test(document.getElementById('output-status').textContent));
-      assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), 'Magandang umaga po. This is a test.');
+      assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), 'Good morning to you. This is a test.');
       const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-button')]);
       assert.match(download.suggestedFilename(), /^transcript-live-\d{4}-\d\d-\d\d_\d\d-\d\d\.txt$/);
-      const saved = fs.readFileSync(await download.path(), 'utf8');
-      assert.strictEqual(saved.trim(), 'Magandang umaga po. This is a test.');
+      assert.strictEqual(fs.readFileSync(await download.path(), 'utf8').trim(), 'Good morning to you. This is a test.');
       await page.reload();
-      assert.strictEqual(await page.inputValue('#transcript'), 'Magandang umaga po. This is a test.');
-      assert.strictEqual(await text(page, '#word-count'), '7 Words');
+      assert.strictEqual(await page.inputValue('#transcript'), 'Good morning to you. This is a test.');
       await page.click('#clear-button');
-      assert.ok(await page.isVisible('#clear-confirm'));
       assert.match(await text(page, '#clear-confirm-text'), /Clear the whole Live transcript/);
       await page.click('#clear-no');
-      assert.ok(!(await page.isVisible('#clear-confirm')));
-      assert.strictEqual(await page.inputValue('#transcript'), 'Magandang umaga po. This is a test.');
+      assert.strictEqual(await page.inputValue('#transcript'), 'Good morning to you. This is a test.');
       await page.click('#clear-button');
       await page.click('#clear-yes');
       assert.strictEqual(await page.inputValue('#transcript'), '');
       assert.strictEqual(await text(page, '#word-count'), '0 Words');
-      await page.reload();
-      assert.strictEqual(await page.inputValue('#transcript'), '');
     });
 
-    await test('File: Download is named after the recording, Clear is off while working, transcript survives refresh', async (page, context) => {
-      await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://localhost:${PORT}` });
+    await test('File: Clear is off while working; Live and File keep separate transcripts; Clear does not lose the paid result', async (page) => {
+      server.pollsUntilDone = 3;
       await openFileTab(page);
-      await chooseFile(page, files.ted);
-      await waitStatus(page, /Ready/);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /^Ready/);
       await page.click('#file-start');
-      await waitStatus(page, /Transcribing/);
-      await page.waitForFunction(() => document.getElementById('file-transcript').value.length > 0, null, { timeout: 60000 });
+      await waitStatus(page, /Speechmatics is transcribing/);
       assert.ok(await page.isDisabled('#clear-button'), 'no clearing while it works');
       await waitStatus(page, /^Done/);
       assert.ok(await page.isEnabled('#clear-button'));
-      const out = await fileText(page);
-      const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-button')]);
-      assert.match(download.suggestedFilename(), /^transcript-ted_60-\d{4}-\d\d-\d\d_\d\d-\d\d\.txt$/);
-      assert.strictEqual(fs.readFileSync(await download.path(), 'utf8').replace(/\r\n/g, '\n').trim(), out.trim());
-      await page.click('#copy-button');
-      await page.waitForFunction(() => /Copied/.test(document.getElementById('output-status').textContent));
-      assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), out);
-      // Live and File keep separate transcripts.
       await page.click('#tab-live');
       assert.strictEqual(await page.inputValue('#transcript'), '');
       await page.click('#tab-file');
-      await page.reload();
-      await openFileTab(page);
-      assert.strictEqual(await fileText(page), out);
-      const words = Number((await text(page, '#word-count')).split(' ')[0]);
-      assert.ok(words > 50, 'word count ' + words);
       await page.click('#clear-button');
       assert.match(await text(page, '#clear-confirm-text'), /Clear the whole File transcript/);
       await page.click('#clear-yes');
-      assert.strictEqual(await fileText(page), '');
+      assert.strictEqual(await page.locator('#file-transcript .turn').count(), 0);
+      assert.strictEqual(await text(page, '#word-count'), '0 Words');
       await page.reload();
       await openFileTab(page);
-      assert.strictEqual(await fileText(page), '');
+      await page.waitForTimeout(300);
+      assert.strictEqual(await page.locator('#file-transcript .turn').count(), 0, 'still cleared after a reload');
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /Already transcribed/);
+      assert.ok(await page.locator('#file-transcript .turn').count() > 0, 'the saved transcript comes back');
+      assert.strictEqual(fnCalls('start-job').length, 1);
     });
 
-    await test('choosing a different file asks before replacing the transcript', async (page) => {
-      await transcribe(page, files.jfk, { language: 'english' });
-      const first = await fileText(page);
-      await chooseFile(page, files.courtroom);
+    await test('choosing a different file asks before replacing the transcript on screen', async (page) => {
+      await transcribe(page, files.jfk, { result: saved('two-speakers') });
+      const first = await screenLines(page);
+      await chooseFile(page, files.mp3);
       await page.waitForSelector('#file-replace', { state: 'visible' });
-      assert.match(await text(page, '#file-replace-text'), /from “jfk\.wav”.*“courtroom\.mp4” will replace it/);
+      assert.match(await text(page, '#file-replace-text'), /from “jfk\.wav”.*“jfk\.mp3” will replace it/);
       await page.click('#file-replace-no');
-      assert.strictEqual(await fileText(page), first);
-      await chooseFile(page, files.courtroom);
+      assert.deepStrictEqual(await screenLines(page), first);
+      await chooseFile(page, files.mp3);
       await page.click('#file-replace-yes');
-      await waitStatus(page, /Ready/);
-      assert.strictEqual(await fileText(page), '');
-      assert.strictEqual(await text(page, '#file-name'), 'courtroom.mp4');
+      await waitStatus(page, /^Ready/);
+      assert.strictEqual(await page.locator('#file-transcript .turn').count(), 0);
+      assert.strictEqual(await text(page, '#file-name'), 'jfk.mp3');
     });
 
-    await test('typing in the File transcript is kept and saved', async (page) => {
-      await transcribe(page, files.jfk, { language: 'english' });
-      await page.locator('#file-transcript').press('End');
-      await page.keyboard.type(' (Edited by hand.)');
-      const edited = await fileText(page);
+    await test('a Whisper transcript saved by the earlier version is still shown and can be copied', async (page) => {
+      await openFileTab(page);
+      assert.strictEqual(await text(page, '#file-transcript'), '[0:00] An older transcript.');
+      assert.strictEqual(await text(page, '#word-count'), '3 Words');
+      await page.click('#copy-button');
+      await page.waitForFunction(() => /Copied/.test(document.getElementById('output-status').textContent));
+      assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), '[0:00] An older transcript.');
+      const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-button')]);
+      assert.match(download.suggestedFilename(), /^transcript-old-/);
+      // Once cleared it stays cleared.
+      await page.click('#clear-button');
+      await page.click('#clear-yes');
       await page.reload();
       await openFileTab(page);
-      assert.strictEqual(await fileText(page), edited);
-      await page.check('#file-timestamps');
-      assert.strictEqual(await fileText(page), edited, 'edits not thrown away');
-      assert.match(await text(page, '#file-status'), /edits are kept/);
-    });
-
-    if (LONG) {
-      console.log('Long recordings (2.5 hours) in Chrome');
-      const long = longFiles();
-      for (const [label, file] of Object.entries(long)) {
-        await test(`${label}: 2.5 hours read end to end in sections by Chrome, memory stays low`, async (page) => {
-          await page.setInputFiles('#file-input', file).catch(() => {});
-          const result = await page.evaluate(async () => {
-            const file = document.getElementById('file-input').files[0];
-            const reader = await window.AudioReader.open(file);
-            const chunker = new window.AudioReader.Chunker(reader);
-            let t = 0, n = 0, gaps = 0, peak = 0;
-            for (;;) {
-              const c = await chunker.next();
-              if (!c) break;
-              if (Math.abs(c.start - t) > 1e-6) gaps++;
-              t = c.end; n++;
-              if (n % 20 === 0 && performance.memory) peak = Math.max(peak, performance.memory.usedJSHeapSize);
-            }
-            return { duration: reader.duration, covered: t, n, gaps, peak, label: reader.label };
-          });
-          assert.ok(Math.abs(result.duration - 9000) < 20, 'duration ' + result.duration);
-          assert.ok(Math.abs(result.covered - 9000) < 5, 'covered ' + result.covered);
-          assert.strictEqual(result.gaps, 0);
-          assert.ok(result.peak < 300 * 1048576, 'heap ' + Math.round(result.peak / 1048576) + ' MB');
-          console.log(`       ${result.n} pieces, ${result.label}, heap at most ${Math.round(result.peak / 1048576)} MB`);
+      assert.strictEqual(await text(page, '#file-transcript'), '');
+    }, {
+      context: async () => {
+        // A phone that used the earlier version: only the old saved transcript is there.
+        const context = await newContext();
+        await context.addInitScript(() => {
+          if (!localStorage.getItem('transcriber.cloudFileState')) {
+            localStorage.setItem('transcriber.fileState', JSON.stringify({ text: '[0:00] An older transcript.', name: 'old.m4a' }));
+          }
         });
+        return context;
       }
-      await test('2.5-hour MP3 in the app: long warning, transcribes, resumes deep in the file', async (page) => {
-        await openFileTab(page);
-        await chooseFile(page, long.mp3);
-        await waitStatus(page, /2 hours 30 minutes long/);
-        assert.match(await text(page, '#file-details'), /2 hours 30 minutes/);
-        await page.click('#file-start');
-        await waitStatus(page, /Transcribing… \d+% \(0:0\d:\d\d of 2:30:00\)/);
-        await page.waitForFunction(() => document.getElementById('file-transcript').value.split('\n').filter(Boolean).length >= 2,
-          null, { timeout: 120000 });
-        await page.click('#file-cancel');
-        await waitStatus(page, /Stopped at 0:0\d:\d\d of 2:30:00/);
-        await page.reload();
-        await openFileTab(page);
-        await chooseFile(page, long.mp3);
-        await waitStatus(page, /Transcribing… \d+% \(0:0\d:\d\d of 2:30:00\)/);
-        await page.click('#file-cancel');
-        await waitStatus(page, /Stopped at/);
-      });
-    }
+    });
   } finally {
     await browser.close();
-    server.kill();
+    web.kill();
   }
 
   console.log(`\n${passed} passed, ${failures.length} failed`);

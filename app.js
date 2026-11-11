@@ -5,19 +5,18 @@
 (function () {
   'use strict';
 
-  var LANGUAGE_KEY = 'transcriber.liveLanguage';
+  var LIVE_LANGUAGE = 'en-US';   // English only
   var LIVE_TEXT_KEY = 'transcriber.liveTranscript';
 
   function $(id) { return document.getElementById(id); }
 
   var els = {
     tabs: Array.prototype.slice.call(document.querySelectorAll('[role="tab"]')),
-    language: $('live-language'),
     toggle: $('live-toggle'),
     toggleLabel: $('live-toggle-label'),
     status: $('live-status'),
     transcript: $('transcript'),
-    fileTranscript: $('file-transcript'),
+    fileOutput: $('file-output'),
     interim: $('interim'),
     interimBox: document.querySelector('.interim-box'),
     heading: $('output-heading'),
@@ -60,8 +59,10 @@
   var activeTab = 'live';
   var fileBusy = false;
 
-  function activeBox() {
-    return activeTab === 'file' ? els.fileTranscript : els.transcript;
+  /** The text of the open tab's transcript (File: in the view that is showing, with or without times). */
+  function outputText() {
+    if (activeTab === 'file') return fileTab ? fileTab.text() : '';
+    return els.transcript.value;
   }
 
   /** Words, not counting timestamps like [1:05] or [1:02:05]. */
@@ -71,8 +72,8 @@
   }
 
   function updateTools() {
-    var text = activeBox().value;
-    var n = countWords(text);
+    var text = outputText();
+    var n = activeTab === 'file' && fileTab ? fileTab.wordCount() : countWords(text);
     els.wordCount.textContent = n + (n === 1 ? ' Word' : ' Words');
     var empty = !text.trim();
     els.copy.disabled = empty;
@@ -90,7 +91,7 @@
     activeTab = tab;
     document.body.dataset.tab = tab;
     els.transcript.hidden = tab !== 'live';
-    els.fileTranscript.hidden = tab !== 'file';
+    els.fileOutput.hidden = tab !== 'file';
     els.heading.textContent = tab === 'file' ? 'File Transcript' : 'Live Transcript';
     els.clearConfirm.hidden = true;
     outputMessage('');
@@ -106,20 +107,22 @@
   }
   function legacyCopy(text) {
     return new Promise(function (resolve, reject) {
-      var box = activeBox();
-      var start = box.selectionStart, end = box.selectionEnd;
-      box.focus();
+      var box = document.createElement('textarea');
+      box.value = text;
+      box.setAttribute('readonly', '');
+      box.style.position = 'fixed';
+      box.style.opacity = '0';
+      document.body.appendChild(box);
       box.select();
       var ok = false;
       try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
-      box.setSelectionRange(start, end);
+      box.remove();
       if (ok) resolve(); else reject(new Error('copy failed'));
-      void text;
     });
   }
 
   els.copy.addEventListener('click', function () {
-    var text = activeBox().value;
+    var text = outputText();
     if (!text.trim()) return;
     copyText(text).then(function () {
       outputMessage('Copied. You can now paste it into another app.', 'done');
@@ -136,14 +139,14 @@
   function downloadName() {
     var label = 'live';
     if (activeTab === 'file') {
-      var name = fileTab && fileTab.file ? fileTab.file.name : (fileTab && fileTab._restoredName) || 'file';
+      var name = (fileTab && fileTab.fileName()) || 'file';
       label = name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9À-ɏ_-]+/g, '-')
         .replace(/^-+|-+$/g, '').slice(0, 40) || 'file';
     }
     return 'transcript-' + label + '-' + stamp(new Date()) + '.txt';
   }
   els.download.addEventListener('click', function () {
-    var text = activeBox().value;
+    var text = outputText();
     if (!text.trim()) return;
     var blob = new Blob([text.replace(/\r?\n/g, '\r\n') + '\r\n'], { type: 'text/plain;charset=utf-8' });
     var url = URL.createObjectURL(blob);
@@ -173,7 +176,6 @@
   els.clearYes.addEventListener('click', function () {
     els.clearConfirm.hidden = true;
     if (activeTab === 'file') {
-      els.fileTranscript.value = '';
       if (fileTab) fileTab.cleared();
     } else {
       els.transcript.value = '';
@@ -184,7 +186,6 @@
   });
 
   els.transcript.addEventListener('input', function () { saveLiveSoon(); updateTools(); });
-  els.fileTranscript.addEventListener('input', updateTools);
 
   // ---------- Tabs ----------
 
@@ -207,19 +208,6 @@
       if (e.key === 'ArrowLeft') next = els.tabs[(index - 1 + els.tabs.length) % els.tabs.length];
       if (next) { e.preventDefault(); selectTab(next, true); }
     });
-  });
-
-  // ---------- Language (remembered on this phone) ----------
-
-  try {
-    var saved = localStorage.getItem(LANGUAGE_KEY);
-    if (saved && els.language.querySelector('option[value="' + saved + '"]')) {
-      els.language.value = saved;
-    }
-  } catch (e) { /* storage blocked; use the default */ }
-
-  els.language.addEventListener('change', function () {
-    try { localStorage.setItem(LANGUAGE_KEY, els.language.value); } catch (e) { /* ignore */ }
   });
 
   // ---------- Live transcript ----------
@@ -255,7 +243,6 @@
     els.toggle.setAttribute('aria-pressed', String(active));
     els.toggle.classList.toggle('is-active', active);
     els.toggleLabel.textContent = active ? 'Stop Listening' : 'Start Listening';
-    els.language.disabled = active;
   }
 
   var live = new window.LiveTranscriber({
@@ -274,7 +261,7 @@
     if (live.isActive()) {
       live.stop();
     } else {
-      live.start(els.language.value);
+      live.start(LIVE_LANGUAGE);
     }
   });
 
@@ -290,11 +277,8 @@
       fileInfo: $('file-info'),
       fileName: $('file-name'),
       fileDetails: $('file-details'),
-      language: $('file-language'),
-      speed: $('file-speed'),
-      speedHint: $('speed-hint'),
+      player: $('file-player'),
       timestamps: $('file-timestamps'),
-      modelNote: $('model-note'),
       start: $('file-start'),
       startLabel: $('file-start-label'),
       cancel: $('file-cancel'),
@@ -309,7 +293,14 @@
       replaceText: $('file-replace-text'),
       replaceYes: $('file-replace-yes'),
       replaceNo: $('file-replace-no'),
-      transcript: els.fileTranscript
+      transcript: $('file-transcript'),
+      speakerList: $('speaker-list'),
+      turnHint: $('turn-hint'),
+      renameBox: $('rename-box'),
+      renameLabel: $('rename-label'),
+      renameInput: $('rename-input'),
+      renameSave: $('rename-save'),
+      renameCancel: $('rename-cancel')
     }, {
       onText: function () { if (activeTab === 'file') updateTools(); },
       onBusy: function (busy) { fileBusy = busy; updateTools(); }

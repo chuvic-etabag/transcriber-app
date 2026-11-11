@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- TEST PAGE ONLY: the File tab as it was in TR Session B (Whisper on the phone).
+       The real app (../../index.html) no longer offers this. Used by tests/whisper.test.js. -->
+  <meta name="robots" content="noindex">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1f5fbf">
+  <meta name="description" content="Turn speech into text in Chrome on Android.">
+  <title>Transcriber</title>
+  <link rel="icon" type="image/png" sizes="192x192" href="../../icons/icon-192.png">
+  <link rel="stylesheet" href="../../styles.css">
+  <!-- Phase 5 will link manifest.json and register service-worker.js here. -->
+</head>
+<body>
+  <header class="app-header">
+    <h1 class="app-title">Transcriber</h1>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Transcription Mode">
+    <button class="tab" role="tab" id="tab-live" aria-controls="panel-live" aria-selected="true">Live</button>
+    <button class="tab" role="tab" id="tab-file" aria-controls="panel-file" aria-selected="false" tabindex="-1">File</button>
+  </nav>
+
+  <main>
+    <!-- Live tab -->
+    <section class="panel" id="panel-live" role="tabpanel" aria-labelledby="tab-live">
+      <h2 class="visually-hidden">Live Microphone</h2>
+
+      <div class="field">
+        <label for="live-language">Language</label>
+        <select id="live-language">
+          <option value="en-US">English (US)</option>
+          <option value="en-PH">English (Philippines)</option>
+          <option value="fil-PH">Filipino</option>
+        </select>
+      </div>
+
+      <button id="live-toggle" class="big-button" type="button" aria-pressed="false">
+        <span class="mic-dot" aria-hidden="true"></span>
+        <span id="live-toggle-label">Start Listening</span>
+      </button>
+
+      <p id="live-status" class="status" role="status" aria-live="polite">
+        Tap Start Listening. Chrome will ask to use your microphone the first time. Tap Allow.
+      </p>
+    </section>
+
+    <!-- File tab -->
+    <section class="panel" id="panel-file" role="tabpanel" aria-labelledby="tab-file" hidden>
+      <h2 class="visually-hidden">Audio or Video File</h2>
+
+      <input type="file" id="file-input" class="visually-hidden" tabindex="-1" aria-hidden="true"
+        accept="audio/*,video/*,.mp3,.m4a,.m4b,.aac,.wav,.ogg,.oga,.opus,.webm,.weba,.flac,.mp4,.m4v,.mov,.mkv,.3gp,.3g2">
+      <button id="file-choose" class="big-button" type="button">Choose Audio or Video File</button>
+
+      <div id="file-info" class="file-info" hidden>
+        <p id="file-name" class="file-name"></p>
+        <p id="file-details" class="muted"></p>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="file-language">Language</label>
+          <select id="file-language">
+            <option value="auto">Auto-Detect</option>
+            <option value="english">English</option>
+            <option value="tagalog">Filipino</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="file-speed">Speed</label>
+          <select id="file-speed" aria-describedby="speed-hint">
+            <option value="fast">Fast</option>
+            <option value="accurate">Accurate</option>
+          </select>
+        </div>
+      </div>
+      <p id="speed-hint" class="hint"></p>
+
+      <label class="check">
+        <input type="checkbox" id="file-timestamps">
+        <span>Show Timestamps</span>
+      </label>
+
+      <p id="model-note" class="note"></p>
+
+      <div id="file-replace" class="confirm" hidden>
+        <p id="file-replace-text"></p>
+        <div class="confirm-buttons">
+          <button id="file-replace-yes" class="small-button danger" type="button">Replace It</button>
+          <button id="file-replace-no" class="small-button" type="button">Keep It</button>
+        </div>
+      </div>
+
+      <button id="file-start" class="big-button" type="button" disabled>
+        <span id="file-start-label">Start Transcribing</span>
+      </button>
+      <button id="file-cancel" class="big-button stop" type="button" hidden>Cancel</button>
+
+      <div id="file-progress-box" class="progress-box" hidden>
+        <progress id="file-progress" max="100" value="0" aria-label="Progress"></progress>
+        <span id="file-percent" class="percent">0%</span>
+      </div>
+
+      <p id="file-status" class="status" role="status" aria-live="polite"></p>
+
+      <div id="file-resume" class="notice" hidden>
+        <p id="file-resume-text"></p>
+        <button id="file-start-over" class="small-button" type="button">Start Over</button>
+      </div>
+    </section>
+
+    <!-- Shared output area: shows the transcript of the tab you are on -->
+    <section class="output" aria-labelledby="output-heading">
+      <div class="output-head">
+        <h2 id="output-heading">Live Transcript</h2>
+        <span id="word-count" class="word-count" aria-live="polite">0 Words</span>
+      </div>
+      <textarea id="transcript" class="transcript" rows="10"
+        placeholder="Your words will appear here." spellcheck="true"
+        aria-labelledby="output-heading" aria-describedby="interim-label"></textarea>
+      <textarea id="file-transcript" class="transcript" rows="10" hidden
+        placeholder="The transcript of your file will appear here." spellcheck="true"
+        aria-labelledby="output-heading"></textarea>
+      <div class="interim-box">
+        <span id="interim-label" class="interim-label">Still Hearing</span>
+        <p id="interim" class="interim" aria-live="off"></p>
+      </div>
+
+      <div class="tools">
+        <button id="copy-button" class="tool-button" type="button">Copy</button>
+        <button id="download-button" class="tool-button" type="button">Download Text File</button>
+        <button id="clear-button" class="tool-button" type="button">Clear</button>
+      </div>
+      <div id="clear-confirm" class="confirm" hidden>
+        <p id="clear-confirm-text">Clear the whole transcript? This cannot be undone.</p>
+        <div class="confirm-buttons">
+          <button id="clear-yes" class="small-button danger" type="button">Yes, Clear It</button>
+          <button id="clear-no" class="small-button" type="button">Keep It</button>
+        </div>
+      </div>
+      <p id="output-status" class="status" role="status" aria-live="polite"></p>
+      <p class="muted saved-note">Transcripts are saved on this device, so a refresh will not lose them.</p>
+    </section>
+  </main>
+
+  <script>window.WHISPER_WORKER_URL = '../../whisper-worker.js';</script>
+  <script src="../../keep-awake.js"></script>
+  <script src="../../audio-reader.js"></script>
+  <script src="../../job-store.js"></script>
+  <script src="../../live.js"></script>
+  <script src="../../whisper-file.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
