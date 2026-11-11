@@ -45,7 +45,7 @@ jobs:
           set -e
           for fn in check-limit start-job job-status job-result delete-audio; do
             echo "Deploying $fn"
-            supabase functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_REF" --no-verify-jwt
+            supabase functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_REF" --no-verify-jwt --yes
           done
 
       - name: List What Is Deployed
