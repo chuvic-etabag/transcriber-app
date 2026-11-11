@@ -3,24 +3,54 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#1f5fbf">
-  <meta name="description" content="Turn speech into text in Chrome on Android.">
+  <meta name="theme-color" content="#2B3A51">
+  <meta name="description" content="Turn English speech into text, and keep your transcripts in one place.">
   <title>Transcriber</title>
   <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
   <link rel="stylesheet" href="styles.css">
   <!-- Phase 5 will link manifest.json and register service-worker.js here. -->
 </head>
-<body>
+<body data-auth="checking">
   <header class="app-header">
     <h1 class="app-title">Transcriber</h1>
+    <div id="account" class="account" hidden>
+      <span id="account-email" class="account-email"></span>
+      <button id="sign-out" class="small-button" type="button">Sign Out</button>
+    </div>
   </header>
 
   <nav class="tabs" role="tablist" aria-label="Transcription Mode">
     <button class="tab" role="tab" id="tab-live" aria-controls="panel-live" aria-selected="true">Live</button>
     <button class="tab" role="tab" id="tab-file" aria-controls="panel-file" aria-selected="false" tabindex="-1">File</button>
+    <button class="tab" role="tab" id="tab-folder" aria-controls="panel-folder" aria-selected="false" tabindex="-1">My Transcripts</button>
   </nav>
 
   <main>
+    <!-- Shown until someone signs in. Nothing else works without it. -->
+    <section class="panel sign-in" id="sign-in" aria-labelledby="sign-in-heading">
+      <h2 id="sign-in-heading">Sign In</h2>
+      <p id="sign-in-intro">Type your email and tap Sign In. A sign-in link will be sent to you; there is no password. You stay signed in on this device until you tap Sign Out.</p>
+      <form id="sign-in-form" novalidate>
+        <label id="sign-in-label" for="sign-in-email">Email</label>
+        <input id="sign-in-email" class="text-input" type="email" name="email" autocomplete="email" inputmode="email"
+          autocapitalize="off" spellcheck="false" placeholder="name@example.com">
+        <button id="sign-in-button" class="big-button" type="submit">Sign In</button>
+      </form>
+      <p id="sign-in-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <p id="auth-checking" class="status checking" role="status">Opening…</p>
+
+    <!-- Once, after the first sign-in on this device: transcripts saved here by the earlier version. -->
+    <div id="move-box" class="notice" hidden>
+      <p id="move-text"></p>
+      <div class="confirm-buttons">
+        <button id="move-yes" class="small-button" type="button">Move Them</button>
+        <button id="move-no" class="small-button" type="button">Not Now</button>
+      </div>
+      <p id="move-status" class="status" role="status" aria-live="polite"></p>
+    </div>
+
     <!-- Live tab -->
     <section class="panel" id="panel-live" role="tabpanel" aria-labelledby="tab-live">
       <h2 class="visually-hidden">Live Microphone</h2>
@@ -51,7 +81,7 @@
 
       <p id="service-note" class="note">
         Recordings are transcribed by Speechmatics for the best accuracy, in English.
-        The sound is uploaded in a small compressed form and deleted once your transcript is saved.
+        The sound is uploaded in a small compressed form and kept with its transcript in My Transcripts until you delete it there.
       </p>
 
       <div id="file-replace" class="confirm" hidden>
@@ -80,8 +110,68 @@
       </div>
     </section>
 
+    <!-- My Transcripts tab -->
+    <section class="panel" id="panel-folder" role="tabpanel" aria-labelledby="tab-folder" hidden>
+      <h2 class="visually-hidden">My Transcripts</h2>
+
+      <div id="folder-list-view">
+        <div class="meter">
+          <p id="storage-text" class="meter-text">Using 0 MB of 1 GB</p>
+          <progress id="storage-bar" max="100" value="0" aria-labelledby="storage-text"></progress>
+        </div>
+
+        <div class="folder-head">
+          <span id="folder-count" class="word-count">0 Transcripts</span>
+          <div class="folder-head-buttons">
+            <button id="folder-refresh" class="small-button" type="button">Refresh</button>
+            <button id="folder-delete-all" class="small-button" type="button" hidden>Delete All</button>
+          </div>
+        </div>
+
+        <div id="delete-all-box" class="confirm" hidden>
+          <p id="delete-all-text"></p>
+          <label id="delete-all-label" for="delete-all-input">Type DELETE to Confirm</label>
+          <input id="delete-all-input" class="text-input" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false">
+          <div class="confirm-buttons">
+            <button id="delete-all-yes" class="small-button danger" type="button" disabled>Yes, Delete Everything</button>
+            <button id="delete-all-no" class="small-button" type="button">Keep Them</button>
+          </div>
+        </div>
+
+        <p id="folder-status" class="status" role="status" aria-live="polite"></p>
+        <ul id="folder-list" class="items"></ul>
+      </div>
+
+      <div id="folder-item-view" hidden>
+        <button id="item-back" class="small-button" type="button">Back to My Transcripts</button>
+        <h3 id="item-name" class="item-title"></h3>
+        <p id="item-meta" class="item-meta"></p>
+        <audio id="item-player" class="player" controls preload="metadata" hidden></audio>
+        <div class="item-buttons">
+          <button id="item-rename" class="small-button" type="button">Rename</button>
+          <button id="item-delete" class="small-button" type="button">Delete</button>
+        </div>
+        <div id="item-rename-box" class="confirm" hidden>
+          <label id="item-rename-label" for="item-rename-input">New Name</label>
+          <input id="item-rename-input" class="text-input" type="text" maxlength="120" autocomplete="off">
+          <div class="confirm-buttons">
+            <button id="item-rename-save" class="small-button" type="button">Save Name</button>
+            <button id="item-rename-cancel" class="small-button" type="button">Cancel</button>
+          </div>
+        </div>
+        <div id="item-delete-box" class="confirm" hidden>
+          <p id="item-delete-text"></p>
+          <div class="confirm-buttons">
+            <button id="item-delete-yes" class="small-button danger" type="button">Yes, Delete It</button>
+            <button id="item-delete-no" class="small-button" type="button">Keep It</button>
+          </div>
+        </div>
+        <p id="item-status" class="status" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
     <!-- Shared output area: shows the transcript of the tab you are on -->
-    <section class="output" aria-labelledby="output-heading">
+    <section class="output" id="output" aria-labelledby="output-heading">
       <div class="output-head">
         <h2 id="output-heading">Live Transcript</h2>
         <span id="word-count" class="word-count" aria-live="polite">0 Words</span>
@@ -96,6 +186,11 @@
             <span class="switch-track" aria-hidden="true"></span>
             <span>Show Timestamps</span>
           </label>
+          <label class="switch">
+            <input type="checkbox" id="file-fillers" role="switch" checked>
+            <span class="switch-track" aria-hidden="true"></span>
+            <span>Show Fillers</span>
+          </label>
           <div id="speaker-list" class="speaker-list" hidden></div>
         </div>
         <div id="rename-box" class="confirm" hidden>
@@ -109,7 +204,7 @@
         </div>
         <div id="file-transcript" class="transcript turns" role="region" aria-labelledby="output-heading" tabindex="0"
           data-placeholder="The transcript of your file will appear here."></div>
-        <p class="hint" id="turn-hint" hidden>Tap a time to play the recording from that moment. Tap a speaker to rename them. Tap the words to correct them.</p>
+        <p class="hint" id="turn-hint" hidden>Tap a time to play the recording from that moment. Tap a speaker to rename them. Tap the words to correct them. Show Fillers off hides “um” and “uh” and repeated words; “mhm” and “uh-huh” always stay.</p>
       </div>
       <div class="interim-box">
         <span id="interim-label" class="interim-label">Still Hearing</span>
@@ -129,7 +224,7 @@
         </div>
       </div>
       <p id="output-status" class="status" role="status" aria-live="polite"></p>
-      <p class="muted saved-note">Transcripts are saved on this device, so a refresh will not lose them.</p>
+      <p id="saved-note" class="muted saved-note">Transcripts are saved on this device, so a refresh will not lose them.</p>
     </section>
   </main>
 
@@ -140,9 +235,14 @@
   <script src="tus-upload.js"></script>
   <script src="cloud-store.js"></script>
   <script src="cloud-config.js"></script>
+  <script src="vendor/supabase/supabase.js"></script>
+  <script src="auth.js"></script>
   <script src="cloud-api.js"></script>
+  <script src="cloud-db.js"></script>
   <script src="live.js"></script>
+  <script src="transcript-view.js"></script>
   <script src="file.js"></script>
+  <script src="folder.js"></script>
   <script src="app.js"></script>
   <!-- Not loaded: whisper-file.js, whisper-worker.js and job-store.js (the hidden on-device Whisper option). -->
 </body>

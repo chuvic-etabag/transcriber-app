@@ -8,9 +8,13 @@
  *   CloudApi.jobResult(jobId)           -> the transcript (Speechmatics json-v2)
  *   CloudApi.deleteAudio(jobId)         -> { deleted: true }
  *
+ * Every call carries the signed-in person's token (auth.js); the functions
+ * refuse anyone who is not signed in or not on the allowed list.
+ *
  * Every failure has a code the File tab turns into plain words:
  *   'offline' | 'network' | 'notSetUp' | 'dailyLimit' | 'speechmatics' | 'busy' |
- *   'notUploaded' | 'unknownJob' | 'notReady' | 'tooLarge' | 'server'
+ *   'notUploaded' | 'unknownJob' | 'notReady' | 'tooLarge' | 'server' |
+ *   'signIn' | 'notAllowed'
  *
  * Exposes window.CloudApi.
  */
@@ -28,6 +32,13 @@
   }
 
   function call(name, body, timeout) {
+    return global.Auth.token().then(function (token) {
+      if (!token) throw ApiError('signIn', 'Not signed in');
+      return send(name, body, timeout, token);
+    });
+  }
+
+  function send(name, body, timeout, token) {
     var config = global.CLOUD_CONFIG;
     var controller = typeof AbortController === 'function' ? new AbortController() : null;
     var timer = controller ? setTimeout(function () { controller.abort(); }, timeout || TIMEOUT_MS) : null;
@@ -36,7 +47,7 @@
       headers: {
         'Content-Type': 'application/json',
         apikey: config.publishableKey,
-        Authorization: 'Bearer ' + config.publishableKey
+        Authorization: 'Bearer ' + token
       },
       body: JSON.stringify(body || {}),
       signal: controller ? controller.signal : undefined

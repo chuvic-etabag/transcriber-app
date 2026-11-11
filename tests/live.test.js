@@ -12,6 +12,9 @@ const { spawn } = require('child_process');
 const path = require('path');
 const assert = require('assert');
 
+const fake = require('./fake-supabase');
+const fakeServer = fake.freshServer();
+
 const ROOT = path.resolve(__dirname, '..');
 const PORT = 8765;
 const URL = `http://localhost:${PORT}/index.html`;
@@ -56,6 +59,9 @@ const failures = [];
 async function test(name, browser, fn, { init = FAKE } = {}) {
   const context = await browser.newContext({ ...devices['Pixel 7'] });
   await context.addInitScript(init);
+  // The app needs a sign-in: start signed in as the allowed person (tests/fake-supabase.js).
+  await context.addInitScript(fake.signedInScript(fake.CHU));
+  await context.route(fake.SUPABASE + '/**', fake.makeRoute(() => fakeServer, `http://localhost:${PORT}`));
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
@@ -145,14 +151,15 @@ async function startListening(page) {
       assert.strictEqual(await page.evaluate(() => window.__current().lang), 'en-US');
     });
 
-    await test('interim words show in grey, then move to the transcript when final', browser, async (page) => {
+    await test('interim words show in italics, then move to the transcript when final', browser, async (page) => {
       await startListening(page);
       await page.evaluate(() => window.__emit([['hello wor', false]]));
       assert.ok(await page.isVisible('.interim-box'));
       assert.strictEqual(await text(page, '#interim'), 'hello wor');
       assert.strictEqual(await value(page), '');
-      const color = await page.$eval('#interim', (e) => getComputedStyle(e).color);
-      assert.strictEqual(color, 'rgb(122, 131, 148)');
+      // Sunset colors: text on the dark background is white, so "still hearing" is set apart by italics.
+      const look = await page.$eval('#interim', (e) => getComputedStyle(e).color + ' ' + getComputedStyle(e).fontStyle);
+      assert.strictEqual(look, 'rgb(255, 255, 255) italic');
       await page.evaluate(() => window.__emit([['hello world', true]]));
       assert.strictEqual(await value(page), 'hello world');
       assert.ok(!(await page.isVisible('.interim-box')));

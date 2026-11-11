@@ -1,6 +1,12 @@
 /*
- * app.js — Screen logic: tabs, the Live tab controls, the File tab, and the
- * shared output area (Copy, Download, Clear, word count) for both tabs.
+ * app.js — Screen logic: signing in and out, the tabs (Live, File,
+ * My Transcripts), the Live tab controls, and the shared output area (Copy,
+ * Download, Clear, word count).
+ *
+ * Nothing works until someone signs in (auth.js): the sign-in screen is all
+ * there is. The File tab and My Transcripts share one transcript view
+ * (transcript-view.js), so an opened item looks and works exactly like a
+ * fresh transcript.
  */
 (function () {
   'use strict';
@@ -17,6 +23,15 @@
     status: $('live-status'),
     transcript: $('transcript'),
     fileOutput: $('file-output'),
+    output: $('output'),
+    savedNote: $('saved-note'),
+    account: $('account'),
+    accountEmail: $('account-email'),
+    signOut: $('sign-out'),
+    signInForm: $('sign-in-form'),
+    signInEmail: $('sign-in-email'),
+    signInButton: $('sign-in-button'),
+    signInStatus: $('sign-in-status'),
     interim: $('interim'),
     interimBox: document.querySelector('.interim-box'),
     heading: $('output-heading'),
@@ -59,9 +74,10 @@
   var activeTab = 'live';
   var fileBusy = false;
 
-  /** The text of the open tab's transcript (File: in the view that is showing, with or without times). */
+  /** The text of the open tab's transcript (File and My Transcripts: in the view that is showing). */
   function outputText() {
     if (activeTab === 'file') return fileTab ? fileTab.text() : '';
+    if (activeTab === 'folder') return folder ? folder.text() : '';
     return els.transcript.value;
   }
 
@@ -73,7 +89,8 @@
 
   function updateTools() {
     var text = outputText();
-    var n = activeTab === 'file' && fileTab ? fileTab.wordCount() : countWords(text);
+    var n = activeTab === 'file' && fileTab ? fileTab.wordCount()
+      : activeTab === 'folder' && folder ? folder.wordCount() : countWords(text);
     els.wordCount.textContent = n + (n === 1 ? ' Word' : ' Words');
     var empty = !text.trim();
     els.copy.disabled = empty;
@@ -87,15 +104,35 @@
     els.outputStatus.dataset.kind = kind || 'info';
   }
 
+  var HEADINGS = { live: 'Live Transcript', file: 'File Transcript', folder: 'Saved Transcript' };
+  var SAVED_NOTES = {
+    live: 'The Live transcript is saved on this device, so a refresh will not lose it.',
+    file: 'Finished transcripts are saved in My Transcripts, with their recordings, until you delete them there.',
+    folder: 'Changes to speaker names and words are saved to My Transcripts.'
+  };
+
   function showOutputFor(tab) {
     activeTab = tab;
     document.body.dataset.tab = tab;
     els.transcript.hidden = tab !== 'live';
-    els.fileOutput.hidden = tab !== 'file';
-    els.heading.textContent = tab === 'file' ? 'File Transcript' : 'Live Transcript';
+    els.fileOutput.hidden = tab === 'live';
+    // The File tab and My Transcripts share the transcript view: hand it to the one on screen.
+    if (fileTab) fileTab.setActive(false);
+    if (folder) folder.setActive(false);
+    if (tab === 'file' && fileTab) fileTab.setActive(true);
+    if (tab === 'folder' && folder) folder.setActive(true);
+    els.heading.textContent = HEADINGS[tab];
+    els.savedNote.textContent = SAVED_NOTES[tab];
+    els.clear.hidden = tab === 'folder';     // a saved item is deleted with Delete, not cleared
     els.clearConfirm.hidden = true;
+    showOrHideOutput();
     outputMessage('');
     updateTools();
+  }
+
+  /** In My Transcripts the transcript area only shows while an item is open. */
+  function showOrHideOutput() {
+    els.output.hidden = activeTab === 'folder' && !(folder && folder.open);
   }
 
   // Copy
@@ -138,8 +175,8 @@
   }
   function downloadName() {
     var label = 'live';
-    if (activeTab === 'file') {
-      var name = (fileTab && fileTab.fileName()) || 'file';
+    if (activeTab !== 'live') {
+      var name = (activeTab === 'folder' ? folder && folder.openName() : fileTab && fileTab.fileName()) || 'file';
       label = name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9À-ɏ_-]+/g, '-')
         .replace(/^-+|-+$/g, '').slice(0, 40) || 'file';
     }
@@ -196,7 +233,7 @@
       t.tabIndex = selected ? 0 : -1;
       document.getElementById(t.getAttribute('aria-controls')).hidden = !selected;
     });
-    showOutputFor(tab.id === 'tab-file' ? 'file' : 'live');
+    showOutputFor(tab.id === 'tab-file' ? 'file' : tab.id === 'tab-folder' ? 'folder' : 'live');
     if (focus) tab.focus();
   }
 
@@ -267,48 +304,174 @@
 
   showState('idle');
 
-  // ---------- File tab ----------
+  // ---------- The transcript view, the File tab and My Transcripts ----------
 
   var fileTab = null;
-  if (window.FileTab) {
-    fileTab = new window.FileTab({
-      input: $('file-input'),
-      choose: $('file-choose'),
-      fileInfo: $('file-info'),
-      fileName: $('file-name'),
-      fileDetails: $('file-details'),
-      player: $('file-player'),
-      timestamps: $('file-timestamps'),
-      start: $('file-start'),
-      startLabel: $('file-start-label'),
-      cancel: $('file-cancel'),
-      progressBox: $('file-progress-box'),
-      progress: $('file-progress'),
-      percent: $('file-percent'),
-      status: $('file-status'),
-      resumeBox: $('file-resume'),
-      resumeText: $('file-resume-text'),
-      startOver: $('file-start-over'),
-      replaceBox: $('file-replace'),
-      replaceText: $('file-replace-text'),
-      replaceYes: $('file-replace-yes'),
-      replaceNo: $('file-replace-no'),
-      transcript: $('file-transcript'),
-      speakerList: $('speaker-list'),
-      turnHint: $('turn-hint'),
-      renameBox: $('rename-box'),
-      renameLabel: $('rename-label'),
-      renameInput: $('rename-input'),
-      renameSave: $('rename-save'),
-      renameCancel: $('rename-cancel')
-    }, {
-      onText: function () { if (activeTab === 'file') updateTools(); },
-      onBusy: function (busy) { fileBusy = busy; updateTools(); }
-    });
-  }
+  var folder = null;
+  var view = new window.TranscriptView({
+    transcript: $('file-transcript'),
+    timestamps: $('file-timestamps'),
+    fillers: $('file-fillers'),
+    speakerList: $('speaker-list'),
+    turnHint: $('turn-hint'),
+    renameBox: $('rename-box'),
+    renameLabel: $('rename-label'),
+    renameInput: $('rename-input'),
+    renameSave: $('rename-save'),
+    renameCancel: $('rename-cancel')
+  }, {
+    onText: function () { updateTools(); },
+    onMessage: function (text, kind) {
+      if (activeTab === 'folder' && folder) folder.itemMessage(text, kind);
+      else if (fileTab) fileTab.message(text, kind);
+    }
+  });
+
+  fileTab = new window.FileTab({
+    input: $('file-input'),
+    choose: $('file-choose'),
+    fileInfo: $('file-info'),
+    fileName: $('file-name'),
+    fileDetails: $('file-details'),
+    player: $('file-player'),
+    start: $('file-start'),
+    startLabel: $('file-start-label'),
+    cancel: $('file-cancel'),
+    progressBox: $('file-progress-box'),
+    progress: $('file-progress'),
+    percent: $('file-percent'),
+    status: $('file-status'),
+    resumeBox: $('file-resume'),
+    resumeText: $('file-resume-text'),
+    startOver: $('file-start-over'),
+    replaceBox: $('file-replace'),
+    replaceText: $('file-replace-text'),
+    replaceYes: $('file-replace-yes'),
+    replaceNo: $('file-replace-no')
+  }, {
+    view: view,
+    onText: function () { if (activeTab === 'file') updateTools(); },
+    onBusy: function (busy) { fileBusy = busy; updateTools(); },
+    onSaved: function () { if (folder) folder.changed(); }
+  });
+
+  folder = new window.Folder({
+    listView: $('folder-list-view'),
+    itemView: $('folder-item-view'),
+    meterText: $('storage-text'),
+    meterBar: $('storage-bar'),
+    count: $('folder-count'),
+    refresh: $('folder-refresh'),
+    deleteAll: $('folder-delete-all'),
+    deleteAllBox: $('delete-all-box'),
+    deleteAllText: $('delete-all-text'),
+    deleteAllInput: $('delete-all-input'),
+    deleteAllYes: $('delete-all-yes'),
+    deleteAllNo: $('delete-all-no'),
+    status: $('folder-status'),
+    list: $('folder-list'),
+    back: $('item-back'),
+    itemName: $('item-name'),
+    itemMeta: $('item-meta'),
+    player: $('item-player'),
+    itemRename: $('item-rename'),
+    itemDelete: $('item-delete'),
+    itemRenameBox: $('item-rename-box'),
+    itemRenameInput: $('item-rename-input'),
+    itemRenameSave: $('item-rename-save'),
+    itemRenameCancel: $('item-rename-cancel'),
+    itemDeleteBox: $('item-delete-box'),
+    itemDeleteText: $('item-delete-text'),
+    itemDeleteYes: $('item-delete-yes'),
+    itemDeleteNo: $('item-delete-no'),
+    itemStatus: $('item-status'),
+    moveBox: $('move-box'),
+    moveText: $('move-text'),
+    moveYes: $('move-yes'),
+    moveNo: $('move-no'),
+    moveStatus: $('move-status')
+  }, {
+    view: view,
+    localStore: window.CloudStore,
+    onText: function () { if (activeTab === 'folder') updateTools(); },
+    onOpen: function () { showOrHideOutput(); outputMessage(''); updateTools(); },
+    onChanged: function (id, fields) { fileTab.cloudChanged(id, fields); },
+    onDeleted: function (ids) { fileTab.forget(ids); }
+  });
 
   showOutputFor('live');
 
+  // ---------- Signing in and out ----------
+
+  var Auth = window.Auth;
+  var shownUser;   // undefined until the first check is done
+
+  function signInMessage(text, kind) {
+    els.signInStatus.textContent = text || '';
+    els.signInStatus.dataset.kind = kind || 'info';
+  }
+
+  /** Show the app to a signed-in person, or only the sign-in screen. */
+  function applyAuth(user) {
+    var id = user ? user.id : null;
+    if (shownUser !== undefined && shownUser === id) return;
+    var before = shownUser;
+    shownUser = id;
+    document.body.dataset.auth = user ? 'in' : 'out';
+    els.account.hidden = !user;
+    els.accountEmail.textContent = user ? user.email : '';
+    if (user) {
+      signInMessage('');
+      els.signInEmail.value = '';
+      fileTab.signedIn(user);
+      folder.signedIn(user);
+    } else {
+      if (live.isActive()) live.stop();
+      if (before) {
+        // Signed out: nothing of that person's stays on screen.
+        fileTab.signedOut();
+        folder.signedOut();
+        selectTab(els.tabs[0], false);
+      }
+    }
+  }
+
+  if (Auth) {
+    Auth.onChange(applyAuth);
+    Auth.ready.then(function (user) {
+      applyAuth(user);
+      if (!user && Auth.linkProblem) signInMessage(Auth.linkProblem, 'warn');
+    });
+  } else {
+    document.body.dataset.auth = 'out';
+    signInMessage('The app could not start. Check your internet connection and reload the page.', 'error');
+    els.signInButton.disabled = true;
+  }
+
+  els.signInForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (!Auth || els.signInButton.disabled) return;
+    var email = els.signInEmail.value;
+    els.signInButton.disabled = true;
+    signInMessage('Sending your sign-in link…');
+    Auth.signIn(email).then(function (sent) {
+      signInMessage(Auth.MESSAGES.sent(sent.email), 'done');
+    }, function (err) {
+      var text = Auth.MESSAGES[err && err.code];
+      signInMessage(typeof text === 'string' ? text : Auth.MESSAGES.failed, err && err.code === 'badEmail' ? 'warn' : 'error');
+    }).then(function () { els.signInButton.disabled = false; });
+  });
+
+  els.signOut.addEventListener('click', function () {
+    if (!Auth) return;
+    els.signOut.disabled = true;
+    Auth.signOut().then(function () {
+      els.signOut.disabled = false;
+      applyAuth(null);
+      signInMessage('You are signed out on this device.');
+    });
+  });
+
   // Handy for testing in the browser console.
-  window.transcriberApp = { live: live, file: fileTab, countWords: countWords, downloadName: downloadName };
+  window.transcriberApp = { live: live, file: fileTab, folder: folder, view: view, countWords: countWords, downloadName: downloadName };
 })();

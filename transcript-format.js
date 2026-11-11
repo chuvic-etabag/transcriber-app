@@ -24,6 +24,10 @@
  *   as "Unknown Speaker".
  * - Every word Speechmatics returns is kept, including "mhm", "uh-huh" and
  *   other disfluencies.
+ * - Show Fillers (see "Fillers" below): with the switch off, hesitations
+ *   ("um", "uh", ...) and back-to-back repeated words are left out of the
+ *   view. Sounds that carry meaning ("mhm", "uh-huh", ...) are always shown.
+ *   Nothing is deleted: the saved turns keep every word.
  *
  * Exposes window.TranscriptFormat (and module.exports for the Node tests).
  */
@@ -286,16 +290,128 @@
     return defaultNames(speakers)[speaker] || 'Unknown Speaker';
   }
 
+  // ---------- Fillers ----------
+
+  // Always shown, whatever the switch says, because they carry meaning (yes, no, surprise...).
+  var ALWAYS_SHOWN = ['mhm', 'm-hm', 'mm-hmm', 'uh-huh', 'mm', 'uh-uh', 'huh-uh', 'aha', 'uh-oh', 'huh', 'aw'];
+  // Hidden when Show Fillers is off: hesitations only.
+  var HESITATIONS = ['um', 'umm', 'uhm', 'uh', 'uhh', 'er', 'erm', 'ah', 'hmm', 'hm'];
+
+  function listSet(list) {
+    var set = Object.create(null);
+    list.forEach(function (w) { set[w] = true; });
+    return set;
+  }
+  var ALWAYS = listSet(ALWAYS_SHOWN);
+  var HIDDEN = listSet(HESITATIONS);
+
+  var EDGE_START = /^[^\p{L}\p{N}]+/u;
+  var EDGE_END = /[^\p{L}\p{N}]+$/u;
+  var ENDS_SENTENCE = /[.?!…]/;
+
+  /** One written word split into the punctuation before it, the word, and the punctuation after it. */
+  function parseToken(raw) {
+    var lead = (raw.match(EDGE_START) || [''])[0];
+    var rest = raw.slice(lead.length);
+    var trail = (rest.match(EDGE_END) || [''])[0];
+    var core = rest.slice(0, rest.length - trail.length);
+    // The word as it is checked against the lists: lower case, any kind of hyphen as "-".
+    var key = core.toLowerCase().replace(/[\u2010-\u2015\u2212]/g, '-');
+    return { lead: lead, core: core, trail: trail, key: key, kept: false };
+  }
+
+  function capitalised(word) {
+    return word ? word.charAt(0).toUpperCase() + word.slice(1) : word;
+  }
+
+  /**
+   * The text of a turn with hesitations and back-to-back repeated words left out.
+   * Every word is checked against the two lists above (Speechmatics' own
+   * "disfluency" label is not used: it also marks some yes and no sounds).
+   *
+   *   "Um, I I I think, uh, we should go."  ->  "I think we should go."
+   *   "Mhm."                                ->  "Mhm."   (always shown)
+   *   "Um."                                 ->  ""       (the turn disappears)
+   */
+  function hideFillers(text) {
+    var tokens = String(text || '').split(/\s+/).filter(Boolean).map(parseToken);
+    var i;
+    // A yes or no sound written as two words ("uh huh", "mm hmm", "uh oh") is kept whole.
+    for (i = 0; i + 1 < tokens.length; i++) {
+      if (!tokens[i].trail && !tokens[i + 1].lead && ALWAYS[tokens[i].key + '-' + tokens[i + 1].key]) {
+        tokens[i].kept = tokens[i + 1].kept = true;
+      }
+    }
+
+    // 1. Leave out the hesitations, tidying the punctuation around them.
+    var out = [];
+    var capitaliseNext = false;
+    tokens.forEach(function (tok) {
+      var prev = out[out.length - 1];
+      var startsSentence = !prev || ENDS_SENTENCE.test(prev.trail);
+      if (!tok.kept && !ALWAYS[tok.key] && HIDDEN[tok.key]) {
+        if (ENDS_SENTENCE.test(tok.trail)) {
+          // "... the, um. Then ..." -> "... the. Then ...": the sentence still ends here.
+          if (!startsSentence) prev.trail = prev.trail.replace(/[,;:\s\u2013\u2014-]+$/, '') + tok.trail.replace(/[,;:]/g, '');
+        } else if (startsSentence) {
+          // "Um, so we went" -> "So we went".
+          if (/^\p{Lu}/u.test(tok.core)) capitaliseNext = true;
+        } else if (/^,/.test(tok.trail) && prev.trail === ',') {
+          // "that, uh, we" -> "that we": both commas were only there for the hesitation.
+          prev.trail = '';
+        }
+        return;
+      }
+      if (capitaliseNext && tok.core) {
+        tok.core = capitalised(tok.core);
+        capitaliseNext = false;
+      }
+      out.push(tok);
+    });
+
+    // 2. Back-to-back repeated words become one ("I I I think" -> "I think").
+    //    Not across the end of a sentence, not for numbers, and never for the always-shown sounds.
+    var kept = [];
+    out.forEach(function (tok) {
+      var prev = kept[kept.length - 1];
+      if (prev && tok.key && tok.key === prev.key && !tok.kept && !prev.kept && !ALWAYS[tok.key] &&
+          !/\d/.test(tok.key) && !ENDS_SENTENCE.test(prev.trail) && !tok.lead) {
+        prev.trail = tok.trail;   // the first one's capital letter, the last one's punctuation
+      } else {
+        kept.push(tok);
+      }
+    });
+
+    return kept.map(function (t) { return t.lead + t.core + t.trail; }).join(' ');
+  }
+
+  /**
+   * The turns as they are shown: [{ n, index, start, end, speaker, overlap, text }].
+   * index is the turn's place in the saved list. With showFillers off, hesitations are left
+   * out, a turn left with no words disappears, and the numbers close up. The saved turns
+   * are never changed, so switching back on shows everything again.
+   */
+  function visibleTurns(turns, showFillers) {
+    var shown = [];
+    (turns || []).forEach(function (t, index) {
+      var text = showFillers === false ? hideFillers(t.text) : t.text;
+      if (showFillers === false && !text) return;
+      shown.push({ n: shown.length + 1, index: index, start: t.start, end: t.end, speaker: t.speaker,
+        overlap: Boolean(t.overlap), text: text });
+    });
+    return shown;
+  }
+
   /** One turn as a line of text. */
   function formatTurn(turn, name, showTimes) {
     return turn.n + '. ' + (showTimes ? range(turn) + ' ' : '') + name +
       (turn.overlap ? ' (overlap)' : '') + ': ' + turn.text;
   }
 
-  /** The whole transcript as text, one turn per line. */
-  function formatTranscript(turns, speakers, renamed, showTimes) {
+  /** The whole transcript as text, one turn per line, in the view asked for. */
+  function formatTranscript(turns, speakers, renamed, showTimes, showFillers) {
     var names = defaultNames(speakers);
-    return turns.map(function (t) {
+    return visibleTurns(turns, showFillers).map(function (t) {
       var custom = renamed && renamed[t.speaker] && String(renamed[t.speaker]).trim();
       return formatTurn(t, custom || names[t.speaker] || 'Unknown Speaker', showTimes);
     }).join('\n');
@@ -319,6 +435,10 @@
     buildTurns: buildTurns,
     defaultNames: defaultNames,
     nameOf: nameOf,
+    ALWAYS_SHOWN: ALWAYS_SHOWN,
+    HESITATIONS: HESITATIONS,
+    hideFillers: hideFillers,
+    visibleTurns: visibleTurns,
     formatTurn: formatTurn,
     formatTranscript: formatTranscript,
     countWords: countWords
