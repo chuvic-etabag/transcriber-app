@@ -279,7 +279,6 @@ progress {
   border-radius: 7px;
   overflow: hidden;
   background: var(--navy);
-  color: var(--rose);
   accent-color: var(--rose);
 }
 progress::-webkit-progress-bar { background: var(--navy); border-radius: 7px; }
@@ -438,7 +437,8 @@ body[data-tab="file"] .interim-box, body[data-tab="folder"] .interim-box { displ
   white-space: nowrap;
 }
 .turn-text { border-radius: 4px; }
-.turn-text:focus { background: var(--rose-tint); outline: none; }
+/* The words being corrected stay white with near-black text; a rose outline marks them. */
+.turn-text:focus { outline: 2px solid var(--rose); outline-offset: 2px; }
 
 .legacy-text { white-space: pre-wrap; margin: 0; color: var(--ink); }
 

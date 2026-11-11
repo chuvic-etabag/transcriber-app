@@ -284,5 +284,228 @@ test('word count counts only what was said', () => {
   assert.strictEqual(F.countWords(r.turns), inputWords(saved('two-speakers')).length);
 });
 
+// ---------- Show Fillers ----------
+
+console.log('Show Fillers');
+
+const ALWAYS = ['mhm', 'm-hm', 'mm-hmm', 'uh-huh', 'mm', 'uh-uh', 'huh-uh', 'aha', 'uh-oh', 'huh', 'aw'];
+const HIDDEN = ['um', 'umm', 'uhm', 'uh', 'uhh', 'er', 'erm', 'ah', 'hmm', 'hm'];
+const cap = (w) => w[0].toUpperCase() + w.slice(1);
+/** The turns as "Speaker N: text" lines in the view asked for (no times). */
+const view = (script, showFillers) => {
+  const r = F.buildTurns(B.build(script));
+  return F.formatTranscript(r.turns, r.speakers, {}, false, showFillers).split('\n').filter(Boolean);
+};
+
+test('the two lists are exactly the ones in the plan', () => {
+  assert.deepStrictEqual(F.ALWAYS_SHOWN, ALWAYS);
+  assert.deepStrictEqual(F.HESITATIONS, HIDDEN);
+  assert.ok(!ALWAYS.some((w) => HIDDEN.includes(w)), 'no word is on both lists');
+});
+
+test('every hesitation on the list is hidden, in any spelling of capitals and with any punctuation', () => {
+  for (const w of HIDDEN) {
+    for (const form of [w, cap(w), w.toUpperCase(), w + ',', cap(w) + '.', w + '...', '"' + w + '"', w + '?', w + ' —']) {
+      assert.strictEqual(F.hideFillers(form).replace(/[^A-Za-z]/g, ''), '', JSON.stringify(form));
+      const inside = F.hideFillers('I think ' + form + ' we can go');
+      assert.ok(!new RegExp('\\b' + w + '\\b', 'i').test(inside), JSON.stringify(form) + ' -> ' + inside);
+      assert.ok(/I think/.test(inside) && /we can go/i.test(inside), inside);
+    }
+  }
+});
+
+test('every always-shown sound stays, in any spelling of capitals and with any punctuation', () => {
+  for (const w of ALWAYS) {
+    for (const form of [w, cap(w), w.toUpperCase(), w + '.', cap(w) + ',', w + '?', cap(w) + '!', '"' + cap(w) + '."']) {
+      assert.strictEqual(F.hideFillers(form), form, JSON.stringify(form));
+      assert.strictEqual(F.hideFillers('Um, ' + form + ' um'), form.replace(/^(["“]?)([a-z])/, (m, q, c) => q + c.toUpperCase()), 'next to hesitations: ' + form);
+      // Said twice, both stay: they are never treated as a repeated word.
+      assert.strictEqual(F.hideFillers(form + ' ' + form), form + ' ' + form);
+    }
+  }
+});
+
+test('yes and no sounds that contain a hesitation are not touched ("uh-huh" is not "uh")', () => {
+  for (const t of ['Uh-huh.', 'Uh-uh.', 'Uh-oh.', 'Huh-uh.', 'Mm-hmm.', 'M-hm.', 'Uh‑huh.', 'Uh–huh.']) {
+    assert.strictEqual(F.hideFillers(t), t, t);
+  }
+  // Written as two words, they are still one sound and stay whole.
+  for (const t of ['Uh huh.', 'Mm hmm.', 'Uh oh.', 'Uh uh.', 'Huh uh.', 'M hm.', 'uh huh, yeah']) {
+    assert.strictEqual(F.hideFillers(t), t, t);
+  }
+  // But two hesitations in a row (with a comma between) are hesitations.
+  assert.strictEqual(F.hideFillers('Uh, uh, I think so.'), 'I think so.');
+  assert.strictEqual(F.hideFillers('Uh, huh?'), 'Huh?');
+});
+
+test('words that merely look similar are never hidden', () => {
+  for (const t of ['The umbrella is here.', 'Ah-ha, I see.', 'Her error was small.', 'Uhuru Park.', 'Hmmm.', 'Ahh.', 'Erm-like.',
+    'An ahi tuna bowl.', 'Umm-hm.', 'He hummed a hymn.', 'Mmm.', 'Oh.', 'Okay.', 'Yeah.', 'No.']) {
+    assert.strictEqual(F.hideFillers(t), t, t);
+  }
+});
+
+test('back-to-back repeated words become one', () => {
+  const cases = [
+    ['I I I think', 'I think'],
+    ['I, I, I think so.', 'I think so.'],
+    ['The the cat sat on on the mat.', 'The cat sat on the mat.'],
+    ['We we went to to to the the shop.', 'We went to the shop.'],
+    ['It was was, you know, fine.', 'It was, you know, fine.'],
+    ['I, um, I think', 'I think'],                      // a hesitation between the repeats
+    ['the THE The end', 'the end'],                     // whatever the capitals
+    ["It's it's fine.", "It's fine."],
+    // Not repeats: a new sentence, different words, numbers.
+    ['It was good. Good food.', 'It was good. Good food.'],
+    ['I did. Did you?', 'I did. Did you?'],
+    ['Call 5 5 5 1 2 3 4.', 'Call 5 5 5 1 2 3 4.'],
+    ['I think I think so', 'I think I think so'],       // repeated phrases are left alone (only single words)
+    ['their there', 'their there']
+  ];
+  for (const [from, to] of cases) assert.strictEqual(F.hideFillers(from), to, from);
+});
+
+test('punctuation and capital letters are tidied where a hesitation was', () => {
+  const cases = [
+    ['Um, so we went home.', 'So we went home.'],
+    ['um, so we went home.', 'so we went home.'],
+    ['And, um, I think that, uh, we should go.', 'And I think that we should go.'],
+    ['I went to the, um. Then we left.', 'I went to the. Then we left.'],
+    ['Is it, uh?', 'Is it?'],
+    ['We left. Um, then it rained.', 'We left. Then it rained.'],
+    ['We left. Um. Then it rained.', 'We left. Then it rained.'],
+    ['Well uh I guess so', 'Well I guess so'],
+    ['Ah, okay.', 'Okay.'],
+    ['Er, no.', 'No.'],
+    ['Hmm, mhm.', 'Mhm.'],
+    ['So, yes.', 'So, yes.']                             // commas that were not around a hesitation stay
+  ];
+  for (const [from, to] of cases) assert.strictEqual(F.hideFillers(from), to, from);
+  assert.strictEqual(F.hideFillers(''), '');
+  assert.strictEqual(F.hideFillers(null), '');
+});
+
+test('switch on: nothing is changed at all', () => {
+  for (const name of ['two-speakers', 'three-speakers', 'many-overlaps', 'long-silences']) {
+    const r = F.buildTurns(saved(name));
+    assert.strictEqual(F.formatTranscript(r.turns, r.speakers, {}, true, true), F.formatTranscript(r.turns, r.speakers, {}, true), name);
+    assert.deepStrictEqual(F.visibleTurns(r.turns, true).map((t) => [t.n, t.text]), r.turns.map((t) => [t.n, t.text]), name);
+  }
+});
+
+test('transcript 1 (mixed): hesitation-only turns disappear and the numbers close up; yes sounds stay', () => {
+  const script = [
+    { speaker: 'S1', at: 0.5, say: 'Um, so I I wanted to ask about the, uh, schedule for next week.' },
+    { speaker: 'S2', at: 2.0, say: 'Mhm.' },                       // said over speaker 1: an overlap turn
+    { speaker: 'S2', at: 7.0, say: 'Um.' },                        // only a hesitation
+    { speaker: 'S1', at: 8.0, say: 'Is Monday okay?' },
+    { speaker: 'S2', at: 10.0, say: 'Uh-huh.' },                   // only a yes sound
+    { speaker: 'S1', at: 11.0, say: 'Hmm.' },                      // only a hesitation, said while speaker 2 goes on
+    { speaker: 'S2', at: 12.0, say: 'Er, Tuesday is is better, um, I think.' },
+    { speaker: 'S1', at: 16.0, say: 'Uh-uh.' },                    // only a no sound
+    { speaker: 'S2', at: 17.0, say: 'Uh, erm.' },                  // only hesitations
+    { speaker: 'S1', at: 18.5, say: 'Huh?' }
+  ];
+  const on = view(script, true);
+  const off = view(script, false);
+  assert.deepStrictEqual(on, [
+    '1. Speaker 1: Um, so I I wanted to ask about the, uh, schedule for next week.',
+    '2. Speaker 2 (overlap): Mhm.',
+    '3. Speaker 2: Um.',
+    '4. Speaker 1: Is Monday okay?',
+    '5. Speaker 2: Uh-huh. Er, Tuesday is is better, um, I think.',
+    '6. Speaker 1 (overlap): Hmm.',
+    '7. Speaker 1: Uh-uh.',
+    '8. Speaker 2: Uh, erm.',
+    '9. Speaker 1: Huh?'
+  ]);
+  // Off: turns 3, 6 and 8 (only hesitations) are gone and the numbers close up.
+  assert.deepStrictEqual(off, [
+    '1. Speaker 1: So I wanted to ask about the schedule for next week.',
+    '2. Speaker 2 (overlap): Mhm.',
+    '3. Speaker 1: Is Monday okay?',
+    '4. Speaker 2: Uh-huh. Tuesday is better I think.',
+    '5. Speaker 1: Uh-uh.',
+    '6. Speaker 1: Huh?'
+  ]);
+  // Back on: every turn is back, numbered as before. Nothing was deleted.
+  assert.deepStrictEqual(view(script, true), on);
+});
+
+test('transcript 2 (only hesitations): with the switch off there is nothing to show', () => {
+  const script = [
+    { speaker: 'S1', at: 0.5, say: 'Um.' }, { speaker: 'S2', at: 2, say: 'Uh, er.' }, { speaker: 'S1', at: 4, say: 'Hmm, hm.' },
+    { speaker: 'S2', at: 6, say: 'Erm, uhm, ah.' }, { speaker: 'S1', at: 9, say: 'Umm, uhh.' }
+  ];
+  assert.strictEqual(view(script, true).length, 5);
+  assert.deepStrictEqual(view(script, false), []);
+  const r = F.buildTurns(B.build(script));
+  assert.strictEqual(F.countWords(F.visibleTurns(r.turns, false)), 0);
+  assert.strictEqual(F.countWords(F.visibleTurns(r.turns, true)), 10);
+});
+
+test('transcript 3 (only yes and no sounds): every turn stays as its own numbered turn, switch on or off', () => {
+  const script = ALWAYS.map((w, i) => ({ speaker: i % 2 ? 'S2' : 'S1', at: 1 + i * 2, say: cap(w) + '.' }));
+  const on = view(script, true);
+  assert.strictEqual(on.length, ALWAYS.length);
+  assert.deepStrictEqual(view(script, false), on);
+  on.forEach((line, i) => assert.ok(line.startsWith(`${i + 1}. Speaker ${i % 2 ? 2 : 1}: ${cap(ALWAYS[i])}.`), line));
+});
+
+test('transcript 4: Speechmatics tags some yes sounds as disfluencies; the tag is ignored, the lists decide', () => {
+  const script = [
+    { speaker: 'S1', at: 0.5, say: 'Do you want, um, tea?' },
+    { speaker: 'S2', at: 3, say: 'Mm.' },                          // the builder tags "mm" as a disfluency, like Speechmatics can
+    { speaker: 'S1', at: 5, say: 'Sugar?' },
+    { speaker: 'S2', at: 7, say: 'Hmm, uh-uh.' }
+  ];
+  const result = B.build(script);
+  const tagged = result.results.filter((x) => (x.alternatives[0].tags || []).includes('disfluency')).map((x) => x.alternatives[0].content.toLowerCase());
+  assert.ok(tagged.includes('mm') && tagged.includes('um'), 'the made-up result has the tag on a yes sound: ' + tagged);
+  // Also tag every word of the last turn, as if Speechmatics called "uh-uh" a disfluency.
+  result.results.forEach((x) => { if (/uh-uh/i.test(x.alternatives[0].content)) x.alternatives[0].tags = ['disfluency']; });
+  const r = F.buildTurns(result);
+  assert.deepStrictEqual(F.formatTranscript(r.turns, r.speakers, {}, false, false).split('\n'), [
+    '1. Speaker 1: Do you want tea?',
+    '2. Speaker 2: Mm.',
+    '3. Speaker 1: Sugar?',
+    '4. Speaker 2: Uh-uh.'
+  ]);
+});
+
+test('transcript 5: an overlap made only of a hesitation disappears; the turn it interrupted stays one turn', () => {
+  const script = [
+    { speaker: 'S1', at: 0.5, say: 'So the plan is to leave early and and drive straight there without stopping at all.' },
+    { speaker: 'S2', at: 2.2, say: 'Um.' },
+    { speaker: 'S2', at: 4.0, say: 'Aha.' },
+    { speaker: 'S1', at: 8.0, say: 'Aw, uh, that is a shame.' }
+  ];
+  assert.deepStrictEqual(view(script, true), [
+    '1. Speaker 1: So the plan is to leave early and and drive straight there without stopping at all. Aw, uh, that is a shame.',
+    '2. Speaker 2 (overlap): Um.',
+    '3. Speaker 2 (overlap): Aha.'
+  ]);
+  assert.deepStrictEqual(view(script, false), [
+    '1. Speaker 1: So the plan is to leave early and drive straight there without stopping at all. Aw that is a shame.',
+    '2. Speaker 2 (overlap): Aha.'
+  ]);
+});
+
+test('the view keeps each turn\'s place in the saved list, times, speaker and overlap mark', () => {
+  const r = F.buildTurns(B.build([
+    { speaker: 'S1', at: 1, say: 'Um.' }, { speaker: 'S2', at: 3, say: 'Hello there.' }, { speaker: 'S1', at: 6, say: 'Uh, hi.' }
+  ]));
+  const shown = F.visibleTurns(r.turns, false);
+  assert.deepStrictEqual(shown.map((t) => [t.n, t.index, t.text, t.speaker]), [[1, 1, 'Hello there.', 'S2'], [2, 2, 'Hi.', 'S1']]);
+  assert.strictEqual(shown[0].start, r.turns[1].start);
+  assert.strictEqual(r.turns[0].text, 'Um.', 'the saved turns are untouched');
+  assert.strictEqual(r.turns[2].text, 'Uh, hi.');
+});
+
+test('with times showing, Copy text follows the same view', () => {
+  const r = F.buildTurns(B.build([{ speaker: 'S1', at: 5, say: 'Um.' }, { speaker: 'S2', at: 65, say: 'Uh, we we can start.' }]));
+  assert.strictEqual(F.formatTranscript(r.turns, r.speakers, { S2: 'Teacher' }, true, false), '1. [00:01:05 – 00:01:06] Teacher: We can start.');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);
