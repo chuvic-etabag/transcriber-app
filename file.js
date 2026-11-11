@@ -227,7 +227,7 @@
   /** What is on screen: which saved file it is (the transcript itself is in IndexedDB). */
   FileTab.prototype._saveState = function () {
     var ok = saveJSON(STATE_KEY, {
-      key: this.job ? this.key : null,
+      key: this.key || null,
       name: this.fileName(),
       legacyText: this.legacyText || '',
       oldChecked: Boolean(this._oldChecked)
@@ -270,6 +270,7 @@
     if (state) {
       this.legacyText = state.legacyText || '';
       this._restoredName = state.name || '';
+      this.key = state.key || null;   // kept even if the page closes before the saved transcript is loaded
     }
     if (!state || !state.oldChecked) {
       // A transcript from the earlier on-device version (TR Session B): keep showing it, once.
@@ -286,7 +287,8 @@
     this.ready = Promise.resolve().then(function () {
       if (!state || !state.key) return null;
       return global.CloudStore.getJob(state.key).then(function (job) {
-        if (!job || self.file) return;
+        if (!job) { if (!self.file && self.key === state.key) self.key = null; return; }
+        if (self.file) return;
         self.key = job.key;
         self.job = job;
         self._restoredName = job.name;
