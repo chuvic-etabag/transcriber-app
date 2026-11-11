@@ -10,8 +10,12 @@
  *   2. Upload: to a private Supabase bucket in 6 MB pieces (tus-upload.js).
  *   3. Speechmatics: an Edge Function starts the job (cloud-api.js); the app
  *      checks on it until it is done. The Speechmatics job number is saved.
- *   4. Save: the transcript is saved on this device, then the uploaded sound
- *      is deleted from the server.
+ *   4. Save: the transcript is saved on this device and in My Transcripts
+ *      (cloud-db.js), together with its uploaded sound, which is kept until
+ *      the item is deleted there.
+ *
+ * Everything needs a signed-in person (auth.js). The transcript itself is
+ * shown by transcript-view.js, the same view My Transcripts uses.
  *
  * Exposes window.FileTab. app.js creates it and gives it the page elements.
  */
@@ -20,11 +24,10 @@
 
   var TF = global.TranscriptFormat;
   var STATE_KEY = 'transcriber.cloudFileState';
-  var SETTINGS_KEY = 'transcriber.cloudFileSettings';
   var OLD_STATE_KEY = 'transcriber.fileState';     // the Whisper transcript from TR Session B
   var LONG_FILE_SECONDS = 60 * 60;
   // How often to ask Speechmatics how it is going (the tests make these shorter).
-  var TIMING = { pollFirst: 4000, poll: 10000, pollSlow: 20000, retry: 8000, busy: 3000 };
+  var TIMING = { pollFirst: 4000, poll: 10000, pollSlow: 20000, retry: 8000, busy: 3000, sync: 1500, lookup: 8000 };
   var MB = 1000 * 1000;
 
   var MESSAGES = {
@@ -79,7 +82,12 @@
     playNeedsFile: function (name) {
       return 'To play the recording from this moment, choose “' + name + '” again with Choose Audio or Video File.';
     },
-    cantPlay: 'This recording cannot be played here, but its transcript is fine.'
+    cantPlay: 'This recording cannot be played here, but its transcript is fine.',
+    gettingAudio: 'Getting the saved recording…',
+    signIn: 'Your sign-in has ended. Tap Sign Out at the top, sign in again, then tap Continue Transcribing. Nothing done so far is lost.',
+    notAllowed: 'This app isn’t open to new users yet.',
+    savedInFolder: ' It is saved in My Transcripts.',
+    notSavedYet: ' It could not be saved to My Transcripts yet; the app will try again by itself. It is safe on this device meanwhile.'
   };
 
   // ---------- Helpers ----------
@@ -130,8 +138,12 @@
 
   function FileTab(els, hooks) {
     this.els = els;
+    this.view = hooks.view;       // shows the transcript (transcript-view.js)
     this.onText = (hooks && hooks.onText) || function () {};
     this.onBusy = (hooks && hooks.onBusy) || function () {};
+    this.onSaved = (hooks && hooks.onSaved) || function () {};   // My Transcripts changed
+    this.user = null;             // the signed-in person; nothing is sent anywhere without one
+    this.active = false;          // is the File tab the one on screen?
     this.file = null;
     this.reader = null;
     this.key = null;
@@ -149,6 +161,7 @@
 
   FileTab.MESSAGES = MESSAGES;
   FileTab.TIMING = TIMING;
+  FileTab.spoken = spoken;
 
   FileTab.prototype._bind = function () {
     var self = this, els = this.els;
@@ -175,61 +188,23 @@
       self._waitingFile = null;
       self.message(self.job && self.job.done ? 'Kept the transcript below.' : MESSAGES.start);
     });
-    els.timestamps.addEventListener('change', function () {
-      self._saveSettings();
-      self._render();
-    });
-
-    // The transcript: tap a time to play, tap a speaker to rename, type to correct.
-    els.transcript.addEventListener('click', function (e) {
-      var time = e.target.closest('.turn-time');
-      if (time) { self.playFrom(Number(time.dataset.start), time.closest('.turn')); return; }
-      var speaker = e.target.closest('.turn-speaker');
-      if (speaker) self.askRename(speaker.dataset.speaker);
-    });
-    els.transcript.addEventListener('input', function (e) {
-      var text = e.target.closest('.turn-text');
-      if (text && self.job && self.job.turns) {
-        var turn = self.job.turns[Number(text.dataset.index)];
-        if (turn) turn.text = text.textContent.replace(/\s+/g, ' ').trim();
-        self._saveJobSoon();
-        self.onText();
-      } else if (e.target.classList.contains('legacy-text')) {
-        self.legacyText = e.target.innerText;
-        self._saveState();
-        self.onText();
-      }
-    });
-    els.transcript.addEventListener('keydown', function (e) {
-      // Enter would start a new line inside a turn; finish editing instead.
-      if (e.key === 'Enter' && e.target.closest('.turn-text')) { e.preventDefault(); e.target.blur(); }
-    });
-    els.speakerList.addEventListener('click', function (e) {
-      var b = e.target.closest('[data-speaker]');
-      if (b) self.askRename(b.dataset.speaker);
-    });
-    els.renameSave.addEventListener('click', function () { self._saveRename(); });
-    els.renameCancel.addEventListener('click', function () { self._closeRename(); });
-    els.renameInput.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') { e.preventDefault(); self._saveRename(); }
-      if (e.key === 'Escape') { e.preventDefault(); self._closeRename(); }
-    });
     els.player.addEventListener('error', function () {
       if (self.els.player.getAttribute('src')) self.message(MESSAGES.cantPlay, 'warn');
     });
-    global.addEventListener('pagehide', function () { self._saveState(); if (self._saveTimer) self._saveJobNow(); });
+    global.addEventListener('pagehide', function () {
+      self._saveState();
+      if (self._saveTimer) self._saveJobNow();
+      if (self._syncTimer) self._syncNow();
+    });
   };
 
   // ---------- Settings and saved state ----------
-
-  FileTab.prototype._saveSettings = function () {
-    saveJSON(SETTINGS_KEY, { timestamps: this.els.timestamps.checked });
-  };
 
   /** What is on screen: which saved file it is (the transcript itself is in IndexedDB). */
   FileTab.prototype._saveState = function () {
     var ok = saveJSON(STATE_KEY, {
       key: this.key || null,
+      userId: this.user ? this.user.id : (this._stateUserId || null),
       name: this.fileName(),
       legacyText: this.legacyText || '',
       oldChecked: Boolean(this._oldChecked)
@@ -265,14 +240,13 @@
 
   FileTab.prototype._restore = function () {
     var self = this;
-    var settings = loadJSON(SETTINGS_KEY);
-    if (settings && typeof settings.timestamps === 'boolean') this.els.timestamps.checked = settings.timestamps;
     var state = loadJSON(STATE_KEY);
     this.message(MESSAGES.start);
     if (state) {
       this.legacyText = state.legacyText || '';
       this._restoredName = state.name || '';
       this.key = state.key || null;   // kept even if the page closes before the saved transcript is loaded
+      this._stateUserId = state.userId || null;
     }
     if (!state || !state.oldChecked) {
       // A transcript from the earlier on-device version (TR Session B): keep showing it, once.
@@ -286,63 +260,221 @@
     }
     this._oldChecked = true;
     this._render();
+    // The transcript that was on screen comes back from this device's storage.
     this.ready = Promise.resolve().then(function () {
       if (!state || !state.key) return null;
       return global.CloudStore.getJob(state.key).then(function (job) {
         if (!job) { if (!self.file && self.key === state.key) self.key = null; return; }
-        if (self.file) return;
+        if (self.file || self.key !== state.key) return;
         self.key = job.key;
         self.job = job;
         self._restoredName = job.name;
         self._render();
       });
-    }).catch(function () {}).then(function () {
-      return global.CloudStore.latestUnfinished();
-    }).then(function (job) {
-      if (!job || self.file || self.running) return;
-      if ((job.stage === 'processing' && job.jobId) || (job.stage === 'uploaded' && job.objectPath && !job.failed)) {
-        // The sound is already uploaded or with Speechmatics: carry on and collect the
-        // transcript, no file needed. (A transcript that was on screen stays saved: choosing
-        // its file again shows it.)
-        self.key = job.key;
-        self.job = job;
-        self._restoredName = job.name;
-        self._showResume('Carrying on with “' + job.name + '”. Its transcript will appear below when it is ready.', false);
-        self.start();
-        return;
-      }
-      self.message(MESSAGES.interrupted(job.name), 'warn');
-    }).catch(function () {}).then(function () {
-      self._retryDeletes();
-    });
-  };
-
-  /** Uploaded sound whose delete didn't get through last time (no internet): try again. */
-  FileTab.prototype._retryDeletes = function () {
-    var self = this;
-    var store = global.CloudStore;
-    if (!store.allJobs) return;
-    store.allJobs().then(function (jobs) {
-      jobs.filter(function (j) { return j.done && j.jobId && !j.audioDeleted; }).forEach(function (j) {
-        self._deleteUploaded(j);
-      });
     }).catch(function () {});
   };
 
-  FileTab.prototype._deleteUploaded = function (job) {
+  /** Is this saved record this person's? (Records from before sign-in existed belong to whoever signs in.) */
+  FileTab.prototype._mine = function (job) {
+    return Boolean(job) && Boolean(this.user) && (!job.userId || job.userId === this.user.id);
+  };
+
+  /** Called by app.js when someone signs in: carry on with anything unfinished. */
+  FileTab.prototype.signedIn = function (user) {
     var self = this;
-    this._deleting = this._deleting || {};
-    if (this._deleting[job.jobId]) return this._deleting[job.jobId];
-    var done = function () { delete self._deleting[job.jobId]; };
-    this._deleting[job.jobId] = global.CloudApi.deleteAudio(job.jobId).then(function () {
-      job.audioDeleted = true;
-      // The one on screen: save it as it is now (keeping any renames or corrections).
-      if (self.job && self.job.key === job.key) { self.job.audioDeleted = true; return self._saveJob(); }
-      return global.CloudStore.getJob(job.key).then(function (saved) {
-        if (saved) { saved.audioDeleted = true; return global.CloudStore.putJob(saved); }
+    this.user = user;
+    this.ready = this.ready.then(function () {
+      if (self.user !== user) return;
+      // A different person than last time on this device: their screen starts empty.
+      if ((self._stateUserId && self._stateUserId !== user.id) || (self.job && !self._mine(self.job))) self._clearScreen();
+      self._stateUserId = user.id;
+      self._saveState();
+      return global.CloudStore.latestUnfinished(user.id).then(function (job) {
+        if (!job || self.file || self.running || self.user !== user) return;
+        if ((job.stage === 'processing' && job.jobId) || (job.stage === 'uploaded' && job.objectPath && !job.failed)) {
+          // The sound is already uploaded or with Speechmatics: carry on and collect the
+          // transcript, no file needed. (A transcript that was on screen stays saved: choosing
+          // its file again shows it.)
+          self.key = job.key;
+          self.job = job;
+          self._restoredName = job.name;
+          self._showResume('Carrying on with “' + job.name + '”. Its transcript will appear below when it is ready.', false);
+          self.start();
+          return;
+        }
+        self.message(MESSAGES.interrupted(job.name), 'warn');
+      }).catch(function () {});
+    }).then(function () {
+      if (self.user === user) return self._retryCloudSaves();
+    }).catch(function () {});
+    return this.ready;
+  };
+
+  /** Called by app.js on Sign Out: stop, and leave nothing of this person's on screen. */
+  FileTab.prototype.signedOut = function () {
+    this.user = null;
+    this._run++;                       // anything running stops at its next step
+    this.cancelled = true;
+    if (this.upload) { this.upload.stop(); this.upload = null; }
+    clearTimeout(this._syncTimer);
+    this._syncTimer = null;
+    if (this.running) this._setRunning(false);
+    this._clearScreen();
+    this._stateUserId = null;
+    this._saveState();
+    this.message(MESSAGES.start);
+  };
+
+  FileTab.prototype._clearScreen = function () {
+    this.file = null;
+    this.reader = null;
+    this.job = null;
+    this.key = null;
+    this.legacyText = '';
+    this._restoredName = '';
+    this._waitingFile = null;
+    this._hasCompactAudio = false;
+    this._setPlayer(null);
+    this.els.fileInfo.hidden = true;
+    this.els.replaceBox.hidden = true;
+    this._showResume('');
+    this._progress(null);
+    this._render();
+    this._updateStartButton();
+  };
+
+  // ---------- My Transcripts (the cloud copy) ----------
+
+  /** Is this the path of a recording in this person's own cloud folder? */
+  FileTab.prototype._ownPath = function (path) {
+    return Boolean(path) && Boolean(this.user) && path.indexOf(this.user.id + '/') === 0;
+  };
+
+  FileTab.prototype._newPath = function () {
+    return this.user.id + '/' + uuid() + '.ogg';
+  };
+
+  /**
+   * Save a finished transcript, with its recording, in My Transcripts. Never fails:
+   * if it can't be saved now (no internet), the record is marked and tried again later.
+   */
+  FileTab.prototype._saveToCloud = function (job) {
+    var self = this;
+    if (!this.user || !job.turns) return Promise.resolve(false);
+    return global.CloudDb.save({
+      title: job.title || job.name,
+      fileName: job.name,
+      duration: job.duration || job.resultDuration || 0,
+      turns: job.turns,
+      speakers: job.speakers || [],
+      names: job.names || {},
+      audioPath: job.audioPath || null,
+      audioBytes: job.compactBytes || 0,
+      jobId: job.jobId || null,
+      fileKey: job.key,
+      createdAt: job.doneAt || null
+    }).then(function (id) {
+      job.cloudId = id;
+      job.cloudPending = false;
+      job.cloudDirty = false;
+      job.userId = job.userId || (self.user && self.user.id);
+      // An upload from before sign-in existed is not in this person's folder, so it is not kept.
+      if (job.jobId && job.objectPath && !job.audioPath) global.CloudApi.deleteAudio(job.jobId).catch(function () {});
+      return self._putJob(job).then(function () { self.onSaved(id); return true; });
+    }, function (err) {
+      job.cloudPending = true;
+      if (global.console) global.console.warn('Transcriber: not saved to My Transcripts yet', err && err.code, err);
+      return self._putJob(job).then(function () { return false; });
+    });
+  };
+
+  /** Save a record on this device without changing what is on screen. */
+  FileTab.prototype._putJob = function (job) {
+    if (this.job && this.job.key === job.key && this.job !== job) return Promise.resolve();
+    return global.CloudStore.putJob(job).catch(function () {});
+  };
+
+  /** Transcripts and corrections that could not reach My Transcripts last time: try again. */
+  FileTab.prototype._retryCloudSaves = function () {
+    var self = this;
+    var store = global.CloudStore;
+    if (!store.allJobs || !this.user) return Promise.resolve();
+    var userId = this.user.id;
+    return store.allJobs().then(function (jobs) {
+      var waiting = jobs.filter(function (j) {
+        return j.done && j.turns && j.userId === userId && (j.cloudPending || (j.cloudDirty && j.cloudId));
       });
-    }).catch(function () { /* tried again next time the app opens */ }).then(done);
-    return this._deleting[job.jobId];
+      return waiting.reduce(function (before, saved) {
+        return before.then(function () {
+          if (!self.user || self.user.id !== userId) return;
+          // The one on screen: use it as it is now (with any newer corrections).
+          var job = self.job && self.job.key === saved.key ? self.job : saved;
+          if (job.cloudPending || !job.cloudId) return self._saveToCloud(job);
+          return self._syncNow(job);
+        });
+      }, Promise.resolve());
+    }).catch(function () {});
+  };
+
+  /** After a rename or a corrected word: save to My Transcripts a moment later. */
+  FileTab.prototype._syncSoon = function () {
+    var self = this;
+    var job = this.job;
+    if (!job || !job.cloudId) return;
+    job.cloudDirty = true;
+    clearTimeout(this._syncTimer);
+    this._syncTimer = setTimeout(function () { self._syncNow(job); }, TIMING.sync);
+  };
+
+  FileTab.prototype._syncNow = function (job) {
+    var self = this;
+    clearTimeout(this._syncTimer);
+    this._syncTimer = null;
+    job = job || this.job;
+    if (!job || !job.cloudId || !this.user) return Promise.resolve();
+    return global.CloudDb.update(job.cloudId, { turns: job.turns, speakers: job.speakers || [], names: job.names || {} }).then(function () {
+      job.cloudDirty = false;
+      self.onSaved(job.cloudId);
+      return self._putJob(job);
+    }, function (err) {
+      if (err && err.code === 'gone') {
+        // Deleted from My Transcripts (on another device): it stays on this screen only.
+        job.cloudId = null;
+        job.cloudDirty = false;
+        return self._putJob(job);
+      }
+      // Still marked as changed: tried again the next time the app opens.
+    });
+  };
+
+  /** My Transcripts changed this item (renamed speakers, corrected words): show the same here. */
+  FileTab.prototype.cloudChanged = function (id, fields) {
+    var job = this.job;
+    if (!job || job.cloudId !== id) return;
+    if (fields.turns) job.turns = fields.turns;
+    if (fields.names) job.names = fields.names;
+    this._docOf = null;
+    this._saveJob(job);
+    this._render();
+  };
+
+  /** Items deleted from My Transcripts are forgotten on this device too. ids: a list, or null for all. */
+  FileTab.prototype.forget = function (ids) {
+    var self = this;
+    var gone = function (job) { return job && job.cloudId && self._mine(job) && (!ids || ids.indexOf(job.cloudId) !== -1); };
+    if (gone(this.job) && this.job.done) {
+      this.job = null;
+      this.key = null;
+      if (!this.running) { this.file = null; this.reader = null; this._setPlayer(null); this.els.fileInfo.hidden = true; }
+      this._showResume('');
+      this.message(MESSAGES.start);
+      this._render();
+      this._saveState();
+      this._updateStartButton();
+    }
+    return global.CloudStore.allJobs().then(function (jobs) {
+      return Promise.all(jobs.filter(gone).map(function (j) { return global.CloudStore.deleteJob(j.key); }));
+    }).catch(function () {});
   };
 
   // ---------- Messages and progress ----------
@@ -418,188 +550,131 @@
     return this.job && this.job.done && this.job.turns ? this.job.turns : null;
   };
 
+  /** What the transcript view shows for this tab (see transcript-view.js), or null. */
+  FileTab.prototype._doc = function () {
+    var self = this;
+    var job = this.job;
+    if (this._turns()) {
+      if (!this._docOf || this._docOf.job !== job || this._docOf.doc.turns !== job.turns) {
+        job.names = job.names || {};
+        this._docOf = {
+          job: job,
+          doc: {
+            turns: job.turns,
+            speakers: job.speakers || [],
+            names: job.names,
+            changed: function (kind) {
+              job.names = this.names;
+              if (kind === 'names') self._saveJob(job); else self._saveJobSoon();
+              self._syncSoon();
+            },
+            play: function (seconds) { return self.playFrom(seconds); }
+          }
+        };
+      }
+      return this._docOf.doc;
+    }
+    this._docOf = null;
+    if (this.legacyText) {
+      return {
+        legacyText: this.legacyText,
+        changed: function () { self.legacyText = this.legacyText; self._saveState(); }
+      };
+    }
+    return null;
+  };
+
   FileTab.prototype._hasText = function () {
     return Boolean(this.text().trim());
   };
 
-  /** The transcript as text, in the view that is showing (with or without times). */
+  /** The transcript as text, in the view that is showing (times and fillers on or off). */
   FileTab.prototype.text = function () {
-    var turns = this._turns();
-    if (turns) return TF.formatTranscript(turns, this.job.speakers || [], this.job.names || {}, this.els.timestamps.checked);
-    return this.legacyText || '';
+    return this.view.textOf(this._doc());
   };
 
   FileTab.prototype.wordCount = function () {
-    var turns = this._turns();
-    if (turns) return TF.countWords(turns);
-    var m = String(this.legacyText || '').replace(/\[\d{1,2}(?::\d{2}){1,2}\]/g, ' ').match(/[^\s]+/g);
-    return m ? m.length : 0;
+    return this.view.wordCountOf(this._doc());
+  };
+
+  /** app.js says which tab is on screen; the transcript view is shared with My Transcripts. */
+  FileTab.prototype.setActive = function (active) {
+    this.active = active;
+    if (active) this._render();
   };
 
   FileTab.prototype._render = function () {
-    var self = this;
-    var box = this.els.transcript;
-    var turns = this._turns();
-    var showTimes = this.els.timestamps.checked;
-    box.textContent = '';
-    this.els.speakerList.textContent = '';
-    this.els.speakerList.hidden = true;
-    this.els.turnHint.hidden = true;
-    if (turns) {
-      var speakers = this.job.speakers || [];
-      var names = this.job.names || {};
-      var frag = document.createDocumentFragment();
-      turns.forEach(function (t, i) {
-        var p = document.createElement('p');
-        p.className = 'turn' + (t.overlap ? ' is-overlap' : '');
-        p.dataset.n = t.n;
-        var n = document.createElement('span');
-        n.className = 'turn-n';
-        n.textContent = t.n + '. ';
-        p.appendChild(n);
-        if (showTimes) {
-          var time = document.createElement('button');
-          time.type = 'button';
-          time.className = 'turn-time';
-          time.dataset.start = t.start;
-          time.textContent = TF.range(t);
-          time.setAttribute('aria-label', 'Play from ' + TF.clock(t.start));
-          p.appendChild(time);
-          p.appendChild(document.createTextNode(' '));
-        }
-        var who = document.createElement('button');
-        who.type = 'button';
-        who.className = 'turn-speaker';
-        who.dataset.speaker = t.speaker;
-        who.textContent = TF.nameOf(t.speaker, speakers, names);
-        p.appendChild(who);
-        if (t.overlap) {
-          var o = document.createElement('span');
-          o.className = 'turn-overlap';
-          o.textContent = ' (overlap)';
-          p.appendChild(o);
-        }
-        p.appendChild(document.createTextNode(': '));
-        var text = document.createElement('span');
-        text.className = 'turn-text';
-        text.dataset.index = i;
-        text.contentEditable = 'plaintext-only';
-        if (text.contentEditable !== 'plaintext-only') text.contentEditable = 'true';
-        text.spellcheck = true;
-        text.textContent = t.text;
-        p.appendChild(text);
-        frag.appendChild(p);
-      });
-      box.appendChild(frag);
-      this._renderSpeakers();
-      this.els.turnHint.hidden = !turns.length;
-      if (!turns.length) box.textContent = '';
-    } else if (this.legacyText) {
-      var pre = document.createElement('p');
-      pre.className = 'legacy-text';
-      pre.contentEditable = 'plaintext-only';
-      if (pre.contentEditable !== 'plaintext-only') pre.contentEditable = 'true';
-      pre.textContent = this.legacyText;
-      box.appendChild(pre);
-    }
+    if (this.active) this.view.setDoc(this._doc());
     this.onText();
-    void self;
   };
-
-  FileTab.prototype._renderSpeakers = function () {
-    var self = this;
-    var list = this.els.speakerList;
-    var speakers = (this.job && this.job.speakers) || [];
-    list.textContent = '';
-    speakers.forEach(function (s) {
-      var b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'small-button';
-      b.dataset.speaker = s;
-      b.textContent = 'Rename ' + TF.nameOf(s, speakers, self.job.names || {});
-      list.appendChild(b);
-    });
-    list.hidden = !speakers.length;
-  };
-
-  // ---------- Renaming speakers ----------
 
   FileTab.prototype.askRename = function (speaker) {
-    if (!this._turns()) return;
-    var speakers = this.job.speakers || [];
-    var current = TF.nameOf(speaker, speakers, this.job.names || {});
-    var number = TF.defaultNames(speakers)[speaker] || current;
-    this._renaming = speaker;
-    this.els.renameLabel.textContent = 'New Name for ' + number + (current !== number ? ' (Now “' + current + '”)' : '');
-    this.els.renameInput.value = current === number ? '' : current;
-    this.els.renameInput.placeholder = number;
-    this.els.renameBox.hidden = false;
-    this.els.renameInput.focus();
-  };
-
-  FileTab.prototype._closeRename = function () {
-    this.els.renameBox.hidden = true;
-    this._renaming = null;
+    if (this.active && this._turns()) this.view.askRename(speaker);
   };
 
   /** Rename one speaker: every turn by them changes. An empty name goes back to "Speaker N". */
   FileTab.prototype.rename = function (speaker, name) {
     if (!this._turns()) return;
+    if (this.active) { this.view.setDoc(this._doc()); this.view.rename(speaker, name); return; }
+    var doc = this._doc();
     var clean = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 40);
-    this.job.names = this.job.names || {};
-    if (clean) this.job.names[speaker] = clean;
-    else delete this.job.names[speaker];
-    this._saveJob();
-    this._render();
-  };
-
-  FileTab.prototype._saveRename = function () {
-    if (!this._renaming) return;
-    var speaker = this._renaming;
-    var value = this.els.renameInput.value;
-    this._closeRename();
-    this.rename(speaker, value);
-    var label = TF.nameOf(speaker, this.job.speakers || [], this.job.names || {});
-    this.message('Renamed. Every turn by this speaker now says “' + label + '”.', 'done');
+    if (clean) doc.names[speaker] = clean; else delete doc.names[speaker];
+    doc.changed('names');
   };
 
   // ---------- Playing from a time ----------
 
-  FileTab.prototype.playFrom = function (seconds, turnEl) {
-    var player = this.els.player;
-    if (!this.file || !player.getAttribute('src')) {
-      this.message(MESSAGES.playNeedsFile(this.fileName() || 'the recording'), 'warn');
-      return;
-    }
+  FileTab.prototype.playFrom = function (seconds) {
     var self = this;
-    player.hidden = false;
-    var go = function () {
-      try { player.currentTime = Math.max(0, seconds); } catch (e) { /* not ready yet */ }
-      var played = player.play();
-      if (played && played.catch) played.catch(function () { /* the person can press play */ });
-    };
-    if (player.readyState >= 1) go();
-    else player.addEventListener('loadedmetadata', go, { once: true });
-    var playing = this.els.transcript.querySelector('.turn.is-playing');
-    if (playing) playing.classList.remove('is-playing');
-    if (turnEl) turnEl.classList.add('is-playing');
-    void self;
+    var player = this.els.player;
+    var job = this.job;
+    if (this.file && player.getAttribute('src')) {
+      global.TranscriptView.playFrom(player, seconds);
+      return true;
+    }
+    if (job && job.audioPath && this.user) {
+      // No file chosen (the app was reopened): play the recording kept in My Transcripts.
+      if (this._cloudAudio === job.audioPath && player.getAttribute('src')) {
+        global.TranscriptView.playFrom(player, seconds);
+        return true;
+      }
+      this.message(MESSAGES.gettingAudio);
+      global.CloudDb.audioUrl(job.audioPath).then(function (url) {
+        if (self.job !== job || self.file) return;
+        self._cloudAudio = job.audioPath;
+        player.setAttribute('src', url);
+        self.els.fileInfo.hidden = false;
+        self.els.fileName.textContent = job.name || 'Recording';
+        self.els.fileDetails.textContent = (job.duration ? spoken(job.duration) + ' · ' : '') + 'Saved recording';
+        self.message('Playing the saved recording.');
+        global.TranscriptView.playFrom(player, seconds);
+      }, function () {
+        if (self.job === job) self.message(MESSAGES.playNeedsFile(self.fileName() || 'the recording'), 'warn');
+      });
+      return true;
+    }
+    this.message(MESSAGES.playNeedsFile(this.fileName() || 'the recording'), 'warn');
+    return false;
   };
 
   FileTab.prototype._setPlayer = function (file) {
     var player = this.els.player;
     if (this.playerUrl) URL.revokeObjectURL(this.playerUrl);
+    this._cloudAudio = null;
     this.playerUrl = file ? URL.createObjectURL(file) : null;
     if (this.playerUrl) player.setAttribute('src', this.playerUrl);
     else { player.removeAttribute('src'); player.hidden = true; }
     player.hidden = !file;
   };
 
-  /** Called by app.js when the person clears the File transcript. The saved job stays, so nothing is paid twice. */
+  /**
+   * Called by app.js when the person clears the File transcript from the screen. The saved
+   * job stays (nothing is paid twice) and so does the copy in My Transcripts.
+   */
   FileTab.prototype.cleared = function () {
     this.legacyText = '';
     if (this.job && this.job.done) { this.job = null; this.key = null; }
-    this._closeRename();
+    this.view.closeRename();
     this._render();
     this._saveState();
   };
@@ -608,7 +683,8 @@
 
   FileTab.prototype.choose = function (file, confirmed) {
     var self = this;
-    if (this.running) return Promise.resolve();
+    if (this.running || !this.user) return Promise.resolve();
+    var user = this.user;
     this._showResume('');
     this.els.replaceBox.hidden = true;
 
@@ -645,16 +721,34 @@
         self.message('Choose what to do with the current transcript.');
         return null;
       }
-      return global.CloudStore.getJob(key).catch(function () { return null; });
+      return global.CloudStore.getJob(key).catch(function () { return null; }).then(function (job) {
+        if (job && !self._mine(job)) job = null;       // someone else's record on this device
+        if (job && job.stage && job.stage !== 'new' && !job.pruned) return job;
+        // Not known on this device: was it already transcribed on another one? Then it is in
+        // My Transcripts and is shown from there instead of being paid for again.
+        var lookup = global.CloudDb.findByFileKey(key).catch(function () { return null; });
+        var giveUp = wait(TIMING.lookup).then(function () { return null; });
+        return Promise.race([lookup, giveUp]).then(function (row) {
+          if (!row || !Array.isArray(row.turns)) return job;
+          var found = {
+            key: key, name: file.name, size: file.size, duration: Number(row.duration_seconds) || reader.duration,
+            stage: 'done', done: true, turns: row.turns, speakers: row.speakers || [], names: row.speaker_names || {},
+            cloudId: row.id, audioPath: row.audio_path || null, compactBytes: Number(row.audio_bytes) || 0,
+            jobId: row.speechmatics_id || null, userId: user.id, createdAt: Date.now(), doneAt: Date.parse(row.created_at) || Date.now()
+          };
+          return global.CloudStore.putJob(found).catch(function () {}).then(function () { return found; });
+        });
+      });
     }).then(function (job) {
       finished();
-      if (asked || self.running) return;
+      if (asked || self.running || self.user !== user) return;
       self.file = file;
       self.reader = reader;
       self.key = key;
       self.legacyText = '';
       self.job = job || { key: key, name: file.name, size: file.size, duration: reader.duration, stage: 'new', createdAt: Date.now() };
       self.job.name = file.name;
+      self.job.userId = user.id;
       self._setPlayer(file);
       self._showFileInfo();
       self._render();
@@ -668,7 +762,8 @@
         return self.start();
       }
       if (job && job.done) {
-        self._showResume('This file was already transcribed. Its saved transcript is below, so it was not sent again.', false);
+        self._showResume('This file was already transcribed. Its saved transcript is below, so it was not sent again.' +
+          (job.cloudId ? ' It is also in My Transcripts.' : ''), false);
         self.message('Already transcribed.', 'done');
         self._progress(null);
         self._updateStartButton();
@@ -713,8 +808,15 @@
 
   FileTab.prototype.start = function () {
     var self = this;
-    if (this.running || this._choosing || !this.job || this.job.done) return Promise.resolve();
+    if (this.running || this._choosing || !this.job || this.job.done || !this.user) return Promise.resolve();
     var job = this.job;
+    job.userId = job.userId || this.user.id;
+    // An upload begun before sign-in existed went to a folder that is now closed: begin it again.
+    if (job.stage === 'uploading' && !this._ownPath(job.objectPath)) {
+      job.objectPath = this._newPath();
+      job.uploadUrl = null;
+      job.uploadOffset = 0;
+    }
     var run = ++this._run;
     // Ask Chrome not to clear this app's saved progress when space runs low.
     if (global.navigator.storage && global.navigator.storage.persist) global.navigator.storage.persist().catch(function () {});
@@ -790,7 +892,7 @@
         if (isQuotaError(err)) self.message(MESSAGES.space, 'warn');
       }).then(function () {
         job.stage = 'uploading';
-        job.objectPath = 'uploads/' + uuid() + '.ogg';
+        job.objectPath = self._newPath();
         job.uploadUrl = null;
         job.uploadOffset = 0;
         job.compactBytes = out.bytes;
@@ -824,7 +926,13 @@
       show(job.uploadOffset || 0);
       var up = new global.ResumableUpload(audio, {
         endpoint: config.uploadEndpoint,
-        headers: { authorization: 'Bearer ' + config.publishableKey, apikey: config.publishableKey },
+        // Asked before every piece, so a long upload always carries a current sign-in.
+        headers: function () {
+          return global.Auth.token().then(function (token) {
+            if (!token) { var e = new Error('Not signed in'); e.code = 'signIn'; throw e; }
+            return { authorization: 'Bearer ' + token, apikey: config.publishableKey };
+          });
+        },
         bucket: config.bucket,
         objectName: job.objectPath,
         contentType: 'audio/ogg',
@@ -852,6 +960,7 @@
         self.upload = null;
         self._waitingNet = false;
         if (err.code === 'stopped') throw err;
+        if (err.code === 'signIn') throw TabError('signIn');
         if (err.code === 'tooLarge') throw TabError('tooLong');
         if (err.code === 'denied') throw TabError('uploadDenied');
         throw TabError('uploadFailed', { detail: err.message });
@@ -876,7 +985,7 @@
           job.stage = 'uploading';
           job.uploadUrl = null;
           job.uploadOffset = 0;
-          job.objectPath = 'uploads/' + uuid() + '.ogg';
+          job.objectPath = self._newPath();
           return self._saveJob(job).then(function () {
             self._setCancellable(true);
             return self._upload(job, null, stillMine);
@@ -965,14 +1074,17 @@
       job.stage = 'done';
       job.done = true;
       job.doneAt = Date.now();
-      job.audioDeleted = false;
-      return global.CloudStore.putJob(job).then(function () {
-        // Saved on this device: now the uploaded sound can go.
-        self._deleteUploaded(job);
-        global.CloudStore.prune().catch(function () {});
-      }, function (err) {
-        // Not saved (no space): show it anyway, but keep the sound so it can be collected again.
+      // The uploaded sound is kept with the transcript in My Transcripts until the item is deleted.
+      job.audioPath = self._ownPath(job.objectPath) ? job.objectPath : null;
+      job.cloudPending = true;
+      return global.CloudStore.putJob(job).then(null, function (err) {
+        // Not saved on this device (no space): show it anyway; My Transcripts still gets it.
         self.message(isQuotaError(err) ? MESSAGES.space : MESSAGES.storage, 'warn');
+      }).then(function () {
+        self.message('Saving to My Transcripts…');
+        return self._saveToCloud(job);
+      }).then(function () {
+        global.CloudStore.prune().catch(function () {});
       });
     });
   };
@@ -986,7 +1098,8 @@
     var length = job.duration || job.resultDuration;
     var text = 'Done. Transcribed ' + (length ? spoken(length) + ' of audio' : 'the recording') + '.';
     if (!job.turns.length) text += ' No speech was found in this file.';
-    this.message(text, 'done');
+    text += job.cloudId ? MESSAGES.savedInFolder : MESSAGES.notSavedYet;
+    this.message(text, job.cloudId ? 'done' : 'warn');
     this._updateStartButton();
   };
 
@@ -1063,6 +1176,8 @@
         if (job) { job.failed = true; job.stage = 'uploaded'; job.jobId = null; this._saveJob(job); }
         break;
       case 'notSetUp': text = MESSAGES.notSetUp; break;
+      case 'signIn': text = MESSAGES.signIn; kind = 'warn'; break;
+      case 'notAllowed': text = MESSAGES.notAllowed; break;
       case 'busy': text = MESSAGES.busy; kind = 'warn'; break;
       case 'server': case 'badRequest': case 'unknownJob': text = MESSAGES.server; break;
       case 'needFile': text = MESSAGES.needFile(this.fileName()); kind = 'warn'; break;

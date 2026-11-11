@@ -3,8 +3,9 @@
 #
 # verify_jwt = false: the web page uses Supabase's new publishable key, which
 # is not a JWT, so Supabase's built-in check would turn every request away.
-# The functions protect themselves instead (allowed web pages, daily limit,
-# and only jobs this app started).
+# The functions protect themselves instead: each one checks the sign-in token
+# of the person asking (allowed emails only), the allowed web pages, the daily
+# limit, and that the job or recording belongs to that person.
 
 project_id = "transcriber"
 

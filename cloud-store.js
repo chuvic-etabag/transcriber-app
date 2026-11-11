@@ -6,10 +6,14 @@
  * Two stores:
  *   jobs:  one record per file, found by a fingerprint of its contents:
  *          { key, name, size, duration, stage, objectPath, uploadUrl, uploadOffset,
- *            compactBytes, jobId, turns, speakers, names, done, createdAt, updatedAt }
+ *            compactBytes, jobId, turns, speakers, names, done, createdAt, updatedAt,
+ *            userId (who it belongs to), cloudId (its item in My Transcripts),
+ *            audioPath (its recording kept in the cloud), cloudPending / cloudDirty
+ *            (still to be saved to My Transcripts) }
  *          stage: 'new' | 'uploading' | 'uploaded' | 'processing' | 'done'
  *   audio: the small converted recording waiting to be uploaded { key, blob }
- *          (deleted once Speechmatics has it)
+ *          (deleted from this device once Speechmatics has it; the uploaded copy
+ *          stays in the cloud with its transcript)
  *
  * Exposes window.CloudStore with promise-returning functions.
  */
@@ -131,10 +135,13 @@
     });
   }
 
-  /** The most recently worked-on file that is not finished, if any. */
-  function latestUnfinished() {
+  /**
+   * The most recently worked-on file that is not finished, if any. With userId: only that
+   * person's (records from before sign-in existed have no owner and count as theirs).
+   */
+  function latestUnfinished(userId) {
     return allJobs().then(function (jobs) {
-      return jobs.filter(function (j) { return !j.done && !j.pruned && j.stage && j.stage !== 'new'; })
+      return jobs.filter(function (j) { return !j.done && !j.pruned && j.stage && j.stage !== 'new' && (!userId || !j.userId || j.userId === userId); })
         .sort(function (a, b) { return b.updatedAt - a.updatedAt; })[0] || null;
     });
   }

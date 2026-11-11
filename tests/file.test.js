@@ -1,8 +1,9 @@
 /*
  * Browser tests for the File tab with Speechmatics (file.js) and the output
- * tools, in Chromium. Supabase (resumable uploads and the Edge Functions) is
- * played by this test, and "Speechmatics" answers with made-up results in
- * its exact json-v2 format (tests/fixtures/). Run from the repo root:
+ * tools, in Chromium. Supabase (sign-in, resumable uploads, the database and
+ * the Edge Functions) is played by tests/fake-supabase.js, and "Speechmatics"
+ * answers with made-up results in its exact json-v2 format (tests/fixtures/).
+ * Every test starts signed in as the allowed person. Run from the repo root:
  *
  *   node tests/file.test.js
  *
@@ -24,9 +25,9 @@ const PORT = 8768;
 const ORIGIN = `http://localhost:${PORT}`;
 const URL = `${ORIGIN}/index.html`;
 const ONLY = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7);
-const SUPABASE = 'https://mgiwopbaglgzxeaowzzt.supabase.co';
-const FIX = path.join(__dirname, 'fixtures', 'speechmatics');
-const saved = (name) => JSON.parse(fs.readFileSync(path.join(FIX, name + '.json'), 'utf8'));
+const fake = require('./fake-supabase');
+const SUPABASE = fake.SUPABASE;
+const saved = fake.saved;
 
 // ---------- Test media ----------
 
@@ -49,129 +50,12 @@ function testFiles() {
   return f;
 }
 
-// ---------- A pretend Supabase + Speechmatics ----------
+// ---------- A pretend Supabase + Speechmatics (tests/fake-supabase.js) ----------
 
-function freshServer() {
-  return {
-    uploads: new Map(),        // id -> { length, bytes: Buffer[], received, objectName, contentType }
-    objects: new Map(),        // objectName -> Buffer
-    calls: [],                 // { fn, body } for the Edge Functions
-    tus: [],                   // { method, id, offset, size }
-    jobs: new Map(),           // jobId -> { path, seconds, polls, status, why }
-    nextJob: 1,
-    // Knobs the tests turn:
-    result: saved('two-speakers'),
-    pollsUntilDone: 1,
-    limitReached: false,
-    limitAtStart: false,
-    startFails: 0,             // how many start-job calls answer "Speechmatics failed"
-    startBusy: 0,              // how many start-job calls answer "busy"
-    reject: null,              // a reason to reject the next job
-    notDeployed: false,
-    patchFails: 0,             // how many PATCH requests answer 500
-    holdPatch: null,           // a function that, when set, decides to hold a PATCH (returns a promise)
-    afterPatch: null
-  };
-}
-
-let server = freshServer();
+let server = fake.freshServer();
+const freshServer = fake.freshServer;
 const fnCalls = (fn) => server.calls.filter((c) => c.fn === fn);
-
-const CORS = {
-  'access-control-allow-origin': ORIGIN,
-  'access-control-allow-headers': '*',
-  'access-control-allow-methods': 'GET, POST, PATCH, HEAD, DELETE, OPTIONS',
-  'access-control-expose-headers': 'Location, Upload-Offset, Upload-Length, Tus-Resumable'
-};
-
-async function fakeSupabase(route) {
-  const req = route.request();
-  const url = new globalThis.URL(req.url());
-  const method = req.method();
-  if (method === 'OPTIONS') return route.fulfill({ status: 200, headers: CORS, body: '' });
-  const h = req.headers();
-  const reply = (status, body, extra) => route.fulfill({
-    status, headers: { ...CORS, 'content-type': 'application/json', ...(extra || {}) }, body: body === undefined ? '' : JSON.stringify(body)
-  });
-
-  // Every call carries the publishable key and nothing secret.
-  assert.strictEqual(h.apikey, 'sb_publishable_BZjwO2iS-yPbM-MBotusbQ_3lIVcMAS');
-
-  // --- Resumable uploads (tus) ---
-  if (url.pathname.startsWith('/storage/v1/upload/resumable')) {
-    const id = url.pathname.split('/')[5];
-    if (method === 'POST' && !id) {
-      const meta = Object.fromEntries(h['upload-metadata'].split(',').map((kv) => {
-        const [k, v] = kv.split(' ');
-        return [k, Buffer.from(v, 'base64').toString()];
-      }));
-      assert.strictEqual(meta.bucketName, 'recordings');
-      assert.match(meta.objectName, /^uploads\/[0-9a-f-]{36}\.ogg$/);
-      assert.strictEqual(meta.contentType, 'audio/ogg');
-      const newId = 'up' + (server.uploads.size + 1);
-      server.uploads.set(newId, { length: Number(h['upload-length']), bytes: [], received: 0, objectName: meta.objectName });
-      server.tus.push({ method, id: newId, size: Number(h['upload-length']) });
-      return reply(201, undefined, { location: `${SUPABASE}/storage/v1/upload/resumable/${newId}`, 'tus-resumable': '1.0.0' });
-    }
-    const up = server.uploads.get(id);
-    if (!up) return reply(404, { error: 'not found' });
-    if (method === 'HEAD') {
-      server.tus.push({ method, id, offset: up.received });
-      return route.fulfill({ status: 200, headers: { ...CORS, 'upload-offset': String(up.received), 'upload-length': String(up.length), 'tus-resumable': '1.0.0' } });
-    }
-    if (method === 'PATCH') {
-      const offset = Number(h['upload-offset']);
-      const body = req.postDataBuffer() || Buffer.alloc(0);
-      server.tus.push({ method, id, offset, size: body.length });
-      if (server.holdPatch) {
-        const hold = server.holdPatch(offset, id);
-        if (hold) { await hold; return route.abort('failed').catch(() => {}); }
-      }
-      if (server.patchFails > 0) { server.patchFails--; return reply(500, { error: 'server busy' }); }
-      if (offset !== up.received) return reply(409, { error: 'offset mismatch' });
-      assert.ok(body.length === 6 * 1024 * 1024 || offset + body.length === up.length, 'pieces of exactly 6 MB, except the last');
-      up.bytes.push(body);
-      up.received += body.length;
-      if (up.received === up.length) server.objects.set(up.objectName, Buffer.concat(up.bytes));
-      if (server.afterPatch) server.afterPatch(up);
-      return route.fulfill({ status: 204, headers: { ...CORS, 'upload-offset': String(up.received), 'tus-resumable': '1.0.0' } });
-    }
-    return reply(405, {});
-  }
-
-  // --- Edge Functions ---
-  if (url.pathname.startsWith('/functions/v1/')) {
-    const fn = url.pathname.slice('/functions/v1/'.length);
-    const body = JSON.parse(req.postData() || '{}');
-    server.calls.push({ fn, body });
-    if (server.notDeployed) return reply(404, { code: 'NOT_FOUND', message: 'Requested function was not found' });
-    const limit = () => reply(429, { error: 'dailyLimit', message: 'used up', limitMinutes: 60, usedMinutes: 61 });
-    if (fn === 'check-limit') return server.limitReached ? limit() : reply(200, { open: true, limitMinutes: 60, usedMinutes: 3 });
-    if (fn === 'start-job') {
-      if (server.limitReached || server.limitAtStart) return limit();
-      if (!server.objects.has(body.path)) return reply(404, { error: 'notUploaded', message: 'not uploaded' });
-      if (server.startBusy > 0) { server.startBusy--; return reply(409, { error: 'busy', message: 'busy' }); }
-      if (server.startFails > 0) { server.startFails--; return reply(502, { error: 'speechmatics', message: 'Speechmatics could not take this job right now.' }); }
-      const existing = [...server.jobs.entries()].find(([, j]) => j.path === body.path && j.status !== 'rejected');
-      if (existing) return reply(200, { jobId: existing[0], reused: true });
-      const jobId = 'smjob' + server.nextJob++;
-      server.jobs.set(jobId, { path: body.path, seconds: body.seconds, polls: 0, status: 'running', why: server.reject });
-      server.reject = null;
-      return reply(200, { jobId });
-    }
-    const job = server.jobs.get(body.jobId);
-    if (!job) return reply(404, { error: 'unknownJob', message: 'no such job' });
-    if (fn === 'job-status') {
-      job.polls++;
-      if (job.why) { job.status = 'rejected'; return reply(200, { status: 'failed', speechmaticsStatus: 'rejected', duration: null, errors: [job.why] }); }
-      if (job.polls > server.pollsUntilDone) job.status = 'done';
-      return reply(200, { status: job.status === 'done' ? 'done' : 'running', speechmaticsStatus: job.status, duration: null, errors: [] });
-    }
-    if (fn === 'job-result') return job.status === 'done' ? reply(200, server.result) : reply(409, { error: 'notReady' });
-    if (fn === 'delete-audio') { server.objects.delete(job.path); job.deleted = true; return reply(200, { deleted: true }); }
-  }
-  return reply(404, { error: 'unexpected ' + url.pathname });
-}
+const fakeSupabase = fake.makeRoute(() => server, ORIGIN);
 
 // A pretend Screen Wake Lock (the File tab keeps the screen on while it prepares and uploads).
 const WAKE_LOCK = `
@@ -188,7 +72,8 @@ const WAKE_LOCK = `
 // Quick waits, so the tests don't sit through real pauses between checks.
 const QUICK = `
   window.addEventListener('DOMContentLoaded', () => {
-    if (window.FileTab) Object.assign(window.FileTab.TIMING, { pollFirst: 150, poll: 150, pollSlow: 150, retry: 150, busy: 150 });
+    if (window.FileTab) Object.assign(window.FileTab.TIMING, { pollFirst: 150, poll: 150, pollSlow: 150, retry: 150, busy: 150, sync: 150 });
+    if (window.Folder) Object.assign(window.Folder.TIMING, { sync: 150 });
     if (window.ResumableUpload) window.ResumableUpload.WAITS.splice(0, 99, 100, 150, 200, 250, 300, 300);
   });
 `;
@@ -203,6 +88,8 @@ async function newContext(opts = {}) {
   const context = await browser.newContext({ ...devices['Pixel 7'], acceptDownloads: true, ...opts });
   await context.addInitScript(WAKE_LOCK);
   await context.addInitScript(QUICK);
+  // Signed in as the allowed person, as if they had signed in on this device before.
+  if (!opts.signedOut) await context.addInitScript(fake.signedInScript(fake.CHU));
   await context.route(SUPABASE + '/**', fakeSupabase);
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
   return context;
@@ -317,7 +204,7 @@ const expectedText = (result, names = {}, times = true) => {
 
     console.log('File tab: Speechmatics');
 
-    await test('a file goes all the way: prepare, upload, Speechmatics, numbered turns, sound deleted', async (page) => {
+    await test('a file goes all the way: prepare, upload, Speechmatics, numbered turns, saved with its sound in My Transcripts', async (page) => {
       await openFileTab(page);
       await chooseFile(page, files.jfk);
       await waitStatus(page, /^Ready/);
@@ -331,7 +218,7 @@ const expectedText = (result, names = {}, times = true) => {
       assert.ok(seen.some((t) => /^Preparing the audio… \d+%/.test(t)), 'preparing shown');
       assert.ok(seen.some((t) => /^Uploading… \d+% \([\d.]+ of [\d.]+ MB\)/.test(t)), 'upload progress shown');
       assert.ok(seen.some((t) => /^Speechmatics is transcribing/.test(t)), 'waiting for Speechmatics shown');
-      assert.match(await status(page), /^Done\. Transcribed 11 seconds of audio\.$/);
+      assert.match(await status(page), /^Done\. Transcribed 11 seconds of audio\. It is saved in My Transcripts\.$/);
       // What was uploaded: a small mono Ogg Opus file of the right length.
       const [up] = [...server.uploads.values()];
       const ogg = Buffer.concat(up.bytes);
@@ -343,15 +230,33 @@ const expectedText = (result, names = {}, times = true) => {
       assert.strictEqual(probe.streams[0].channels, 1);
       assert.ok(Math.abs(Number(probe.format.duration) - 11) < 0.1, probe.format.duration);
       assert.ok(ogg.length < 11 * 4000, ogg.length + ' bytes');
-      // The job was started once, with the length, and the sound deleted after the transcript was saved.
+      // The upload went into the signed-in person's own folder, carrying their sign-in.
+      assert.match(up.objectName, new RegExp('^' + fake.CHU.id + '/[0-9a-f-]{36}\\.ogg$'));
+      assert.ok(server.calls.every((c) => c.user && c.user.id === fake.CHU.id), 'every function call is signed in');
+      // The job was started once, with the length. The sound is NOT deleted any more:
+      // it is kept with the transcript in My Transcripts.
       assert.strictEqual(fnCalls('check-limit').length, 1);
       assert.strictEqual(fnCalls('start-job').length, 1);
       assert.strictEqual(fnCalls('start-job')[0].body.path, up.objectName);
       assert.strictEqual(fnCalls('start-job')[0].body.seconds, 11);
       await page.waitForFunction(() => true);
       await new Promise((r) => setTimeout(r, 300));
-      assert.strictEqual(fnCalls('delete-audio').length, 1);
-      assert.ok(!server.objects.has(up.objectName), 'deleted from storage');
+      assert.strictEqual(fnCalls('delete-audio').length, 0, 'the sound is kept');
+      assert.ok(server.objects.has(up.objectName), 'still in storage');
+      assert.strictEqual(server.rows.length, 1, 'one item in My Transcripts');
+      const row = server.rows[0];
+      const built = F.buildTurns(saved('two-speakers'));
+      assert.strictEqual(row.user_id, fake.CHU.id);
+      assert.strictEqual(row.title, 'jfk.wav');
+      assert.strictEqual(row.file_name, 'jfk.wav');
+      assert.strictEqual(row.audio_path, up.objectName);
+      assert.strictEqual(row.audio_bytes, ogg.length);
+      assert.ok(Math.abs(row.duration_seconds - 11) < 0.1, 'length ' + row.duration_seconds);
+      assert.deepStrictEqual(row.turns, built.turns, 'turns with their times');
+      assert.deepStrictEqual(row.speakers, built.speakers);
+      assert.deepStrictEqual(row.speaker_names, {});
+      assert.strictEqual(row.speechmatics_id, 'smjob1');
+      assert.ok(row.first_line.startsWith('Speaker 1: ' + built.turns[0].text.slice(0, 40)), row.first_line);
       // The transcript, exactly as section 3 asks.
       assert.deepStrictEqual(await screenLines(page), expectedText(saved('two-speakers')).split('\n'));
       assert.strictEqual(await text(page, '#word-count'), F.countWords(F.buildTurns(saved('two-speakers')).turns) + ' Words');
@@ -444,10 +349,19 @@ const expectedText = (result, names = {}, times = true) => {
       assert.ok(await page.locator('.turn.is-playing').count() === 1);
       await page.locator('.turn-time').nth(0).click();
       await page.waitForFunction(() => document.getElementById('file-player').currentTime < 3, null, { timeout: 5000 });
-      // After a reload the file is not chosen any more: say how to play it.
+      // After a reload the file is not chosen any more: the recording kept in My Transcripts plays.
       await page.reload();
       await openFileTab(page);
       await page.waitForSelector('.turn-time');
+      await page.locator('.turn-time').nth(1).click();
+      await waitStatus(page, /Playing the saved recording/);
+      await page.waitForFunction(() => !document.getElementById('file-player').paused && document.getElementById('file-player').currentTime >= 6.3, null, { timeout: 8000 });
+      assert.strictEqual(server.signed.length, 1, 'through a play link for their own recording');
+      // If the recording cannot be fetched (no internet), it says how to play it.
+      await page.reload();
+      await openFileTab(page);
+      await page.waitForSelector('.turn-time');
+      server.objects.clear();
       await page.locator('.turn-time').first().click();
       await waitStatus(page, /To play the recording from this moment, choose “jfk\.wav” again/);
       await chooseFile(page, files.jfk);
@@ -561,7 +475,9 @@ const expectedText = (result, names = {}, times = true) => {
       assert.deepStrictEqual(await screenLines(again), expectedText(saved('two-speakers')).split('\n'));
       assert.strictEqual(fnCalls('start-job').length, 1, 'started once');
       await again.waitForTimeout(300);
-      assert.strictEqual(fnCalls('delete-audio').length, 1);
+      assert.strictEqual(fnCalls('delete-audio').length, 0, 'the sound is kept');
+      assert.strictEqual(server.rows.length, 1, 'saved in My Transcripts');
+      assert.strictEqual(server.objects.size, 1);
       // And choosing the file again later: the saved transcript, nothing sent.
       await chooseFile(again, files.jfk);
       await waitStatus(again, /Already transcribed/);
@@ -578,6 +494,7 @@ const expectedText = (result, names = {}, times = true) => {
         const ctx = await chromium.launchPersistentContext(dir, { ...devices['Pixel 7'] });
         await ctx.addInitScript(WAKE_LOCK);
         await ctx.addInitScript(QUICK);
+        await ctx.addInitScript(fake.signedInScript(fake.CHU));
         await ctx.route(SUPABASE + '/**', fakeSupabase);
         return ctx;
       };
@@ -739,24 +656,61 @@ const expectedText = (result, names = {}, times = true) => {
       assert.strictEqual(fnCalls('start-job').length, 2);
     });
 
-    await test('an old transcript removed to save space is collected again from Speechmatics, not paid again', async (page) => {
+    const forgetOnDevice = (page) => page.evaluate(async () => {
+      const store = window.CloudStore;
+      const jobs = await store.allJobs();
+      for (const j of jobs) { delete j.turns; j.done = false; j.pruned = true; j.stage = 'processing'; await store.putJob(j); }
+    });
+
+    await test('an old transcript removed from this device to save space is shown again from My Transcripts, not paid again', async (page) => {
       await transcribe(page, files.jfk, { result: saved('two-speakers') });
-      await page.evaluate(async () => {
-        const store = window.CloudStore;
-        const jobs = await store.allJobs();
-        for (const j of jobs) { delete j.turns; j.done = false; j.pruned = true; j.stage = 'processing'; await store.putJob(j); }
-      });
+      await forgetOnDevice(page);
       const checks = fnCalls('job-status').length;
       await page.reload();
       await openFileTab(page);
       await page.waitForTimeout(400);
       assert.strictEqual(fnCalls('job-status').length, checks, 'not collected by itself at start-up');
       await chooseFile(page, files.jfk);
+      await waitStatus(page, /Already transcribed/);
+      assert.match(await text(page, '#file-resume-text'), /already transcribed.*also in My Transcripts/);
+      assert.deepStrictEqual(await screenLines(page), expectedText(saved('two-speakers')).split('\n'));
+      assert.strictEqual(fnCalls('start-job').length, 1, 'no new job');
+      assert.strictEqual(fnCalls('job-result').length, 1, 'nothing asked of Speechmatics again');
+      assert.strictEqual(server.uploads.size, 1);
+      assert.strictEqual(server.rows.length, 1);
+    });
+
+    await test('...and if it was also deleted from My Transcripts, it is collected again from Speechmatics, not paid again', async (page) => {
+      await transcribe(page, files.jfk, { result: saved('two-speakers') });
+      await forgetOnDevice(page);
+      server.rows = [];
+      await page.reload();
+      await openFileTab(page);
+      await chooseFile(page, files.jfk);
       await waitStatus(page, /^Done/);
       assert.match(await text(page, '#file-resume-text'), /^$/);
       assert.deepStrictEqual(await screenLines(page), expectedText(saved('two-speakers')).split('\n'));
       assert.strictEqual(fnCalls('start-job').length, 1, 'no new job');
       assert.strictEqual(server.uploads.size, 1);
+    });
+
+    await test('a file transcribed on another device is shown from My Transcripts instead of being sent again', async (page) => {
+      await transcribe(page, files.jfk, { result: saved('three-speakers') });
+      // "Another device": this browser knows nothing about the file.
+      await page.evaluate(async () => {
+        for (const j of await window.CloudStore.allJobs()) await window.CloudStore.deleteJob(j.key);
+        localStorage.removeItem('transcriber.cloudFileState');
+      });
+      await page.reload();
+      await openFileTab(page);
+      assert.deepStrictEqual(await screenLines(page), []);
+      await chooseFile(page, files.jfk);
+      await waitStatus(page, /Already transcribed/);
+      assert.deepStrictEqual(await screenLines(page), expectedText(saved('three-speakers')).split('\n'));
+      assert.ok(await page.isDisabled('#file-start'));
+      assert.strictEqual(fnCalls('start-job').length, 1, 'not sent again');
+      assert.strictEqual(server.uploads.size, 1, 'not uploaded again');
+      assert.strictEqual(server.rows.length, 1);
     });
 
     console.log('Problems, in plain words');

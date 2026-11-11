@@ -7,6 +7,8 @@
  *
  *   var up = new ResumableUpload(blob, {
  *     endpoint, headers, bucket, objectName, contentType,
+ *                                // headers: an object, or a function giving one (or a promise
+ *                                // for one), asked before every request so a renewed sign-in is used
  *     url,                       // a saved upload link, to carry on (optional)
  *     onSaved({ url, offset }),  // save these to carry on later
  *     onProgress(sent, total),
@@ -62,20 +64,23 @@
   /** One request. Resolves with the XHR (any status); rejects with code 'network' if it never got an answer. */
   ResumableUpload.prototype._send = function (method, url, headers, body, onUpload) {
     var self = this;
-    return new Promise(function (resolve, reject) {
-      if (self.stopped) { reject(UploadError('stopped')); return; }
-      var xhr = new global.XMLHttpRequest();
-      self.xhr = xhr;
-      xhr.open(method, url, true);
-      xhr.timeout = REQUEST_TIMEOUT_MS;
-      var all = Object.assign({ 'Tus-Resumable': '1.0.0' }, self.opts.headers || {}, headers || {});
-      Object.keys(all).forEach(function (k) { xhr.setRequestHeader(k, all[k]); });
-      if (onUpload && xhr.upload) xhr.upload.onprogress = function (e) { onUpload(e.loaded); };
-      xhr.onload = function () { self.xhr = null; resolve(xhr); };
-      xhr.onerror = function () { self.xhr = null; reject(UploadError('network')); };
-      xhr.ontimeout = xhr.onerror;
-      xhr.onabort = function () { self.xhr = null; reject(UploadError(self.stopped ? 'stopped' : 'network')); };
-      xhr.send(body === undefined ? null : body);
+    var own = typeof this.opts.headers === 'function' ? this.opts.headers() : this.opts.headers;
+    return Promise.resolve(own).then(function (ownHeaders) {
+      return new Promise(function (resolve, reject) {
+        if (self.stopped) { reject(UploadError('stopped')); return; }
+        var xhr = new global.XMLHttpRequest();
+        self.xhr = xhr;
+        xhr.open(method, url, true);
+        xhr.timeout = REQUEST_TIMEOUT_MS;
+        var all = Object.assign({ 'Tus-Resumable': '1.0.0' }, ownHeaders || {}, headers || {});
+        Object.keys(all).forEach(function (k) { xhr.setRequestHeader(k, all[k]); });
+        if (onUpload && xhr.upload) xhr.upload.onprogress = function (e) { onUpload(e.loaded); };
+        xhr.onload = function () { self.xhr = null; resolve(xhr); };
+        xhr.onerror = function () { self.xhr = null; reject(UploadError('network')); };
+        xhr.ontimeout = xhr.onerror;
+        xhr.onabort = function () { self.xhr = null; reject(UploadError(self.stopped ? 'stopped' : 'network')); };
+        xhr.send(body === undefined ? null : body);
+      });
     });
   };
 

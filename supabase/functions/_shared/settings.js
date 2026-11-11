@@ -1,6 +1,8 @@
 // Settings for the Transcriber Edge Functions.
 // After changing anything here, run the "Deploy Edge Functions" workflow on GitHub.
 
+// Who may sign in is NOT set here: it is the table "allowed_emails" (supabase/setup_2.sql).
+
 // The most audio (all users together) that Speechmatics may be sent in one day.
 // New jobs are refused once this many minutes have been transcribed today.
 export const DAILY_LIMIT_MINUTES = 60;
@@ -23,7 +25,8 @@ export const BUCKET = 'recordings';
 // How long the link that lets Speechmatics fetch the audio stays valid.
 export const SIGNED_URL_SECONDS = 60 * 60;
 
-// Uploads nobody used are deleted after this long.
+// Uploads that never finished becoming a transcript are deleted after this long.
+// Recordings of saved transcripts are kept until their owner deletes them.
 export const DELETE_UNUSED_UPLOADS_AFTER_HOURS = 24;
 
 // Speechmatics batch API and the transcription settings:
