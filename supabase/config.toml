@@ -1,0 +1,34 @@
+# Supabase settings for the Transcriber Edge Functions (used by the
+# "Deploy Edge Functions" workflow). The functions are plain JavaScript.
+#
+# verify_jwt = false: the web page uses Supabase's new publishable key, which
+# is not a JWT, so Supabase's built-in check would turn every request away.
+# The functions protect themselves instead (allowed web pages, daily limit,
+# and only jobs this app started).
+
+project_id = "transcriber"
+
+[functions.check-limit]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/check-limit/index.js"
+
+[functions.start-job]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/start-job/index.js"
+
+[functions.job-status]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/job-status/index.js"
+
+[functions.job-result]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/job-result/index.js"
+
+[functions.delete-audio]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/delete-audio/index.js"
