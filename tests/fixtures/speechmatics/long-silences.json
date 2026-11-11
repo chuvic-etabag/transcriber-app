@@ -1,0 +1,526 @@
+{
+  "format": "2.9",
+  "job": {
+    "created_at": "2026-11-11T02:15:31.523Z",
+    "data_name": "recording.ogg",
+    "duration": 420,
+    "id": "silence001"
+  },
+  "metadata": {
+    "created_at": "2026-11-11T02:15:31.523Z",
+    "language_pack_info": {
+      "adapted": false,
+      "itn": true,
+      "language_description": "English",
+      "word_delimiter": " ",
+      "writing_direction": "left-to-right"
+    },
+    "transcription_config": {
+      "diarization": "speaker",
+      "language": "en",
+      "operating_point": "enhanced"
+    },
+    "type": "transcription"
+  },
+  "results": [
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "Is",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 42.27,
+      "start_time": 42,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "this",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 42.59,
+      "start_time": 42.32,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "recording",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 42.91,
+      "start_time": 42.64,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": "?",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 42.91,
+      "is_eos": true,
+      "start_time": 42.91,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "Okay",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 43.23,
+      "start_time": 42.96,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": ",",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 43.23,
+      "is_eos": false,
+      "start_time": 43.23,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "I",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 43.55,
+      "start_time": 43.28,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "think",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 43.87,
+      "start_time": 43.6,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "it",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 44.19,
+      "start_time": 43.92,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "is",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 44.51,
+      "start_time": 44.24,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": ".",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 44.51,
+      "is_eos": true,
+      "start_time": 44.51,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "Sorry",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 95.27,
+      "start_time": 95,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": ",",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 95.27,
+      "is_eos": false,
+      "start_time": 95.27,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "I",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 95.59,
+      "start_time": 95.32,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "had",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 95.91,
+      "start_time": 95.64,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "to",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 96.23,
+      "start_time": 95.96,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "answer",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 96.55,
+      "start_time": 96.28,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "the",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 96.87,
+      "start_time": 96.6,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "door",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 97.19,
+      "start_time": 96.92,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": ".",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 97.19,
+      "is_eos": true,
+      "start_time": 97.19,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "Are",
+          "language": "en",
+          "speaker": "S2"
+        }
+      ],
+      "end_time": 160.77,
+      "start_time": 160.5,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "you",
+          "language": "en",
+          "speaker": "S2"
+        }
+      ],
+      "end_time": 161.09,
+      "start_time": 160.82,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "ready",
+          "language": "en",
+          "speaker": "S2"
+        }
+      ],
+      "end_time": 161.41,
+      "start_time": 161.14,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "now",
+          "language": "en",
+          "speaker": "S2"
+        }
+      ],
+      "end_time": 161.73,
+      "start_time": 161.46,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": "?",
+          "language": "en",
+          "speaker": "S2"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 161.73,
+      "is_eos": true,
+      "start_time": 161.73,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "Yes",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 163.27,
+      "start_time": 163,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": ".",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 163.27,
+      "is_eos": true,
+      "start_time": 163.27,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "Let",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 163.59,
+      "start_time": 163.32,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "us",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 163.91,
+      "start_time": 163.64,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "begin",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 164.23,
+      "start_time": 163.96,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": ".",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 164.23,
+      "is_eos": true,
+      "start_time": 164.23,
+      "type": "punctuation"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "That",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 300.27,
+      "start_time": 300,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "is",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 300.59,
+      "start_time": 300.32,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "all",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 300.91,
+      "start_time": 300.64,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "for",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 301.23,
+      "start_time": 300.96,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.98,
+          "content": "today",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "end_time": 301.55,
+      "start_time": 301.28,
+      "type": "word"
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 1,
+          "content": ".",
+          "language": "en",
+          "speaker": "S1"
+        }
+      ],
+      "attaches_to": "previous",
+      "end_time": 301.55,
+      "is_eos": true,
+      "start_time": 301.55,
+      "type": "punctuation"
+    }
+  ]
+}
