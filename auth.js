@@ -29,6 +29,7 @@
     rate: 'Too many sign-in emails were asked for. Please wait a few minutes (up to an hour), then try again.',
     notSetUp: 'Sign-in is not set up yet. Please try again later.',
     failed: 'The sign-in email could not be sent. Please try again in a minute.',
+    mailSetup: 'The sign-in email could not be sent to this address yet, because the app’s email service is not fully set up. Please tell the app’s owner.',
     linkExpired: 'That sign-in link has expired or was already used. Type your email below to get a new one.',
     sent: function (email) {
       return 'Check your email. A sign-in link was sent to ' + email +
@@ -118,6 +119,8 @@
       if (!error) return { email: email };
       var text = String(error.message || '') + ' ' + String(error.code || '');
       if (error.status === 429 || /rate.?limit/i.test(text)) throw AuthError('rate', text);
+      // Supabase's built-in email only sends to the project's own team until custom SMTP is set up.
+      if (/email_address_not_authorized|not authorized/i.test(text)) throw AuthError('mailSetup', text);
       // The database refuses to make an account for an email that is not on the list.
       if (/Database error saving new user|not open to new users|signup.?(s)?.?(disabled|not allowed)|otp_disabled/i.test(text)) throw AuthError('notAllowed', text);
       if (isNetworkError(error)) throw AuthError(global.navigator.onLine === false ? 'offline' : 'network', text);
