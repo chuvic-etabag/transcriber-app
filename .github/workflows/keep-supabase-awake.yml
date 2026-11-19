@@ -1,0 +1,28 @@
+# Keeps the Supabase project "transcriber" from being paused for inactivity.
+# Every 3 days it sends one tiny read request to the database.
+# It costs nothing: the repository is public, so GitHub Actions minutes are free.
+name: Keep Supabase Awake
+
+on:
+  schedule:
+    - cron: "0 1 */3 * *"   # every 3 days at 9:00 AM Manila time
+  workflow_dispatch:         # lets you run it by hand with Run workflow
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    name: Ping Supabase
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send One Small Request
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://mgiwopbaglgzxeaowzzt.supabase.co/rest/v1/transcripts?select=id&limit=1" \
+            -H "apikey: sb_publishable_BZjwO2iS-yPbM-MBotusbQ_3lIVcMAS")
+          echo "Supabase answered with status $status"
+          if [ "$status" != "200" ]; then
+            echo "::error::Supabase did not answer normally (status $status). The project may already be paused: restore it on the Supabase website."
+            exit 1
+          fi
